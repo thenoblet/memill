@@ -63,5 +63,6 @@ def stem_budget(
     first and renames, so a stem that only fits the final name would fail during
     the copy.
     """
-    used = len(str(destination)) + 1 + len(extension) + len(_PART_SUFFIX)
+    # Reserve 1 character for Windows' NUL terminator (MAX_PATH counts it)
+    used = len(str(destination)) + 1 + len(extension) + len(_PART_SUFFIX) + 1
     return max(16, min(DEFAULT_MAX_STEM, limit - used))

@@ -71,8 +71,9 @@ def test_stem_budget_pathologically_long_destination_yields_minimum() -> None:
 
 
 def test_stem_budget_respects_windows_limit() -> None:
-    # Verify the budget math: destination + "/" + stem + ".mp3.part" <= 260
+    # Verify the budget math: destination + "/" + stem + ".mp3.part" < 260
+    # Must be strictly under (Windows MAX_PATH counts terminating NUL)
     dest = Path("/test/output")
     budget = stem_budget(dest)
     actual_path = len(str(dest)) + 1 + budget + len(".mp3.part")
-    assert actual_path <= WINDOWS_PATH_LIMIT
+    assert actual_path < WINDOWS_PATH_LIMIT
