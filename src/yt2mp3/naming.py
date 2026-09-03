@@ -10,7 +10,10 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from yt2mp3.errors import TransferError
+
 DEFAULT_MAX_STEM = 150
+MIN_STEM = 16
 WINDOWS_PATH_LIMIT = 260
 
 # NTFS rejects these outright. ext4 accepts every one of them, so a sanitiser
@@ -65,4 +68,10 @@ def stem_budget(
     """
     # Reserve 1 character for Windows' NUL terminator (MAX_PATH counts it)
     used = len(str(destination)) + 1 + len(extension) + len(_PART_SUFFIX) + 1
-    return max(16, min(DEFAULT_MAX_STEM, limit - used))
+    available = limit - used
+    if available < MIN_STEM:
+        raise TransferError(
+            f"destination path is too long for a filename: {destination} leaves "
+            f"{available} characters, need at least {MIN_STEM}"
+        )
+    return min(DEFAULT_MAX_STEM, available)

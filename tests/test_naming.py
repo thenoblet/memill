@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from yt2mp3.errors import TransferError
 from yt2mp3.naming import WINDOWS_PATH_LIMIT, sanitize_stem, stem_budget
 
 
@@ -61,19 +62,47 @@ def test_stem_budget_long_destination_yields_smaller() -> None:
     budget = stem_budget(dest)
     assert budget < 150
     assert budget >= 16  # Minimum budget
+    # Also verify the total stays within limit
+    actual_path = len(str(dest)) + 1 + budget + len(".mp3.part")
+    assert actual_path < WINDOWS_PATH_LIMIT
 
 
-def test_stem_budget_pathologically_long_destination_yields_minimum() -> None:
-    # Create an extremely long destination path
-    dest = Path("/" + "a" * 240)
+def test_stem_budget_boundary_at_233_chars_returns_minimum() -> None:
+    # Boundary test: destination length 233 leaves exactly 16 available (259 total)
+    # Should return 16 without raising
+    dest = Path("/" + "a" * 232)
+    assert len(str(dest)) == 233
     budget = stem_budget(dest)
-    assert budget >= 16  # Never goes below minimum
+    assert budget == 16
+    # Verify total is exactly at the usable limit
+    actual_path = len(str(dest)) + 1 + budget + len(".mp3.part")
+    assert actual_path == 259
+
+
+def test_stem_budget_boundary_at_234_chars_raises() -> None:
+    # Boundary test: destination length 234 leaves only 15 available (< MIN_STEM)
+    # Should raise TransferError
+    dest = Path("/" + "a" * 233)
+    assert len(str(dest)) == 234
+    with pytest.raises(TransferError) as exc_info:
+        stem_budget(dest)
+    assert "too long for a filename" in str(exc_info.value)
+
+
+def test_stem_budget_excessive_destination_raises() -> None:
+    # Test case from finding: 258-character destination leaves only -2 available
+    # Should raise TransferError
+    dest = Path("/" + "a" * 257)
+    assert len(str(dest)) == 258
+    with pytest.raises(TransferError) as exc_info:
+        stem_budget(dest)
+    assert "too long for a filename" in str(exc_info.value)
 
 
 def test_stem_budget_respects_windows_limit() -> None:
-    # Verify the budget math: destination + "/" + stem + ".mp3.part" < 260
-    # Must be strictly under (Windows MAX_PATH counts terminating NUL)
-    dest = Path("/test/output")
+    # Boundary test: destination long enough that DEFAULT_MAX_STEM cap doesn't apply
+    # Destination length 201 gives budget 48, total exactly 259 (one under limit)
+    dest = Path("/" + "a" * 200)
     budget = stem_budget(dest)
     actual_path = len(str(dest)) + 1 + budget + len(".mp3.part")
-    assert actual_path < WINDOWS_PATH_LIMIT
+    assert actual_path == WINDOWS_PATH_LIMIT - 1
