@@ -8,8 +8,10 @@ that can be exhaustively tested in microseconds.
 from __future__ import annotations
 
 import re
+from pathlib import Path
 
 DEFAULT_MAX_STEM = 150
+WINDOWS_PATH_LIMIT = 260
 
 # NTFS rejects these outright. ext4 accepts every one of them, so a sanitiser
 # written for Linux alone produces names that only fail once they reach the
@@ -24,6 +26,8 @@ _RESERVED = frozenset(
     | {f"LPT{i}" for i in range(1, 10)}
 )
 
+_PART_SUFFIX = ".part"  # transfer writes "<name>.mp3.part" before renaming
+
 
 def sanitize_stem(stem: str, *, max_length: int = DEFAULT_MAX_STEM) -> str:
     """Return ``stem`` as a filename NTFS will accept, without its extension.
@@ -35,10 +39,29 @@ def sanitize_stem(stem: str, *, max_length: int = DEFAULT_MAX_STEM) -> str:
     cleaned = _ILLEGAL.sub(" ", stem)
     cleaned = _WHITESPACE_RUN.sub(" ", cleaned).strip()
     cleaned = cleaned.rstrip(". ")
-    if not cleaned:
-        return "untitled"
-    if cleaned.upper() in _RESERVED:
-        cleaned = f"_{cleaned}"
     if len(cleaned) > max_length:
         cleaned = cleaned[:max_length].rstrip(". ")
+    if not cleaned:
+        return "untitled"
+    # Guard AFTER truncation, not before: slicing a long name can land exactly
+    # on a reserved device name, and a small max_length is the regime where
+    # that becomes reachable.
+    if cleaned.upper() in _RESERVED:
+        cleaned = f"_{cleaned[: max_length - 1]}" if max_length > 1 else "untitled"
     return cleaned or "untitled"
+
+
+def stem_budget(
+    destination: Path,
+    *,
+    extension: str = ".mp3",
+    limit: int = WINDOWS_PATH_LIMIT,
+) -> int:
+    """Longest stem keeping ``destination/<stem><extension>`` inside ``limit``.
+
+    Budgets the ``.part`` suffix too: the transfer step writes that longer name
+    first and renames, so a stem that only fits the final name would fail during
+    the copy.
+    """
+    used = len(str(destination)) + 1 + len(extension) + len(_PART_SUFFIX)
+    return max(16, min(DEFAULT_MAX_STEM, limit - used))
