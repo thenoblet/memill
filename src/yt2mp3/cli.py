@@ -67,15 +67,31 @@ def _job_count(text: str) -> int:
         raise argparse.ArgumentTypeError(
             f"expected a positive integer, got {text!r}"
         ) from None
-    if jobs < 1:
-        raise argparse.ArgumentTypeError(f"jobs must be at least 1, got {jobs}")
+    try:
+        # Defers to config.py's floor rather than restating it. cpu_count is
+        # unused when jobs is given, so any value serves.
+        plan_concurrency(jobs, cpu_count=1)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
     return jobs
 
 
 def _existing_file(text: str) -> Path:
+    """Refuse a path that is plainly unusable, without opening it.
+
+    exists(), not is_file(): a FIFO from process substitution
+    (``--from-file <(...)``) and ``/dev/stdin`` are both perfectly good
+    sources of a URL list, and both are ``is_file() == False``.
+
+    Opening the path would classify those correctly, but opening a FIFO for
+    reading blocks until a writer attaches -- measured, not assumed -- so the
+    parser would hang on exactly the input this exists to accept.
+    """
     path = Path(text)
-    if not path.is_file():
+    if not path.exists():
         raise argparse.ArgumentTypeError(f"no such file: {text}")
+    if path.is_dir():
+        raise argparse.ArgumentTypeError(f"is a directory, not a file: {text}")
     return path
 
 

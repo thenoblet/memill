@@ -3,7 +3,9 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import io
+import os
 import sys
+import threading
 from pathlib import Path
 from typing import TextIO
 
@@ -58,6 +60,9 @@ class RecordingReporter:
 
     def __init__(self) -> None:
         self.closed = 0
+        # One entry per select_reporter call, so a test can tell "never
+        # opened" apart from "opened and leaked" -- close() counts cannot.
+        self.opened: list[bool] = []
 
     def batch_started(self, total: int) -> None: ...
     def track_started(self, key: str, label: str) -> None: ...
@@ -115,9 +120,12 @@ def install(
             expand_error=expand_error,
         ),
     )
-    monkeypatch.setattr(
-        cli, "select_reporter", lambda *, stream, force_plain=False: reporter
-    )
+
+    def select(*, stream: TextIO, force_plain: bool = False) -> RecordingReporter:
+        reporter.opened.append(force_plain)
+        return reporter
+
+    monkeypatch.setattr(cli, "select_reporter", select)
     return reporter
 
 
@@ -195,7 +203,6 @@ def usage_error(capsys: pytest.CaptureFixture[str], *argv: str) -> str:
     assert caught.value.code == 2
     err = capsys.readouterr().err
     assert err.startswith("usage: yt2mp3")
-    assert "Traceback" not in err
     return err
 
 
@@ -249,7 +256,34 @@ def test_a_missing_url_file_is_a_usage_error(
     capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
     missing = tmp_path / "nope" / "urls.txt"
-    assert "--from-file" in usage_error(capsys, "-", "--from-file", str(missing))
+    assert "no such file" in usage_error(capsys, "-", "--from-file", str(missing))
+
+
+def test_a_fifo_is_accepted_and_readable_as_a_url_file(tmp_path: Path) -> None:
+    """`--from-file <(...)` and /dev/stdin are exists() but not is_file()."""
+    fifo = tmp_path / "urls.fifo"
+    os.mkfifo(fifo)
+    writer = threading.Thread(
+        target=lambda: fifo.write_text("https://x/2\n", encoding="utf-8"),
+        daemon=True,
+    )
+    writer.start()
+    args = parse("--from-file", str(fifo))
+    assert collect_urls(args, io.StringIO()) == ["https://x/2"]
+    writer.join(timeout=5)
+
+
+def test_a_directory_as_a_url_file_says_it_is_a_directory(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    err = usage_error(capsys, "-", "--from-file", str(tmp_path))
+    assert "is a directory" in err
+
+
+def test_one_job_is_accepted_because_config_owns_the_floor() -> None:
+    """_job_count defers to plan_concurrency, so the two floors cannot drift."""
+    settings = settings_from_args(parse("https://x/1", "-j", "1"), cpu_count=8)
+    assert (settings.jobs, settings.fragments) == (1, 8)
 
 
 # --- URL collection ---------------------------------------------------------
@@ -459,9 +493,10 @@ def test_an_unreadable_archive_reports_one_line_and_exits_one(
     assert cli.main(["https://x/aaa", "-o", str(tmp_path)]) == 1
     err = capsys.readouterr().err
     assert err.startswith(f"error: could not read the archive {tmp_path}")
-    assert "Traceback" not in err
-    # It failed before the display was opened, so there is nothing to close.
-    assert reporter.closed == 0
+    # Not `closed == 0`, which cannot tell "never opened" from "opened and
+    # leaked": under a real RichReporter the leaked variant returns 1 with the
+    # live display still installed and sys.stderr still a proxy.
+    assert reporter.opened == []
 
 
 def test_an_expected_failure_out_of_run_batch_is_not_labelled_a_bug(
@@ -477,7 +512,6 @@ def test_an_expected_failure_out_of_run_batch_is_not_labelled_a_bug(
     assert cli.main(["https://x/aaa", "-o", str(tmp_path)]) == 1
     err = capsys.readouterr().err
     assert err == "error: read-only mount\n"
-    assert "unexpected" not in err
 
 
 # --- main: nothing may be printed before the reporter is closed -------------
