@@ -55,11 +55,18 @@ Quality = VbrQuality | CbrQuality
 def plan_concurrency(
     jobs: int | None, *, cpu_count: int, budget: int = CONNECTION_BUDGET
 ) -> tuple[int, int]:
-    """Return ``(jobs, fragments_per_job)`` holding total sockets near ``budget``."""
+    """Return ``(jobs, fragments_per_job)`` holding total sockets to ``budget``.
+
+    The floor is 1, not 2. A floor of 2 lets the product grow without bound once
+    ``jobs`` exceeds the budget -- 16 jobs would open 32 sockets, precisely the
+    throttling this budget exists to prevent. One fragment per job is yt-dlp's
+    own default and costs nothing when track-level parallelism already supplies
+    the concurrency.
+    """
     if jobs is not None and jobs < 1:
         raise ValueError("jobs must be at least 1")
     resolved = jobs if jobs is not None else min(4, max(1, cpu_count))
-    fragments = max(2, budget // resolved)
+    fragments = max(1, budget // resolved)
     return resolved, fragments
 
 

@@ -33,7 +33,7 @@ def test_cbr_rejects_a_bitrate_that_is_not_a_rate() -> None:
 
 @pytest.mark.parametrize(
     ("jobs", "expected"),
-    [(None, (4, 2)), (1, (1, 8)), (2, (2, 4)), (8, (8, 2))],
+    [(None, (4, 2)), (1, (1, 8)), (2, (2, 4)), (8, (8, 1)), (16, (16, 1))],
 )
 def test_concurrency_keeps_the_socket_budget(
     jobs: int | None, expected: tuple[int, int]
@@ -44,6 +44,15 @@ def test_concurrency_keeps_the_socket_budget(
 def test_concurrency_rejects_a_non_positive_job_count() -> None:
     with pytest.raises(ValueError, match="at least 1"):
         plan_concurrency(0, cpu_count=8)
+
+
+@pytest.mark.parametrize("jobs", range(1, 17))
+def test_concurrency_never_multiplies_beyond_the_budget(jobs: int) -> None:
+    resolved, fragments = plan_concurrency(jobs, cpu_count=8)
+    assert resolved == jobs
+    # At or under the budget the product must fit inside it; beyond the budget
+    # the user's explicit -j is the ceiling, never a multiple of it.
+    assert resolved * fragments <= max(8, jobs)
 
 
 def test_settings_are_immutable() -> None:
