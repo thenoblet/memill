@@ -12,10 +12,10 @@ from yt_dlp.cookies import CookieLoadError
 from yt_dlp.utils import DownloadCancelled, ExtractorError, YoutubeDLError
 from yt_dlp.utils import DownloadError as YtDlpDownloadError
 
-from yt2mp3 import source
-from yt2mp3.config import Settings, VbrQuality
-from yt2mp3.errors import DownloadError
-from yt2mp3.source import Downloader, TrackRef
+from memill import source
+from memill.config import Settings, VbrQuality
+from memill.errors import DownloadError
+from memill.source import Downloader, TrackRef
 
 
 def make_settings(tmp_path: Path, **overrides: Any) -> Settings:

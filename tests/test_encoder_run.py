@@ -8,10 +8,10 @@ from pathlib import Path
 
 import pytest
 
-from yt2mp3.config import VbrQuality
-from yt2mp3.encoder import build_encode_command, require_ffmpeg, run_encode
-from yt2mp3.errors import DependencyError, EncodeError
-from yt2mp3.naming import TrackTags
+from memill.config import VbrQuality
+from memill.encoder import build_encode_command, require_ffmpeg, run_encode
+from memill.errors import DependencyError, EncodeError
+from memill.naming import TrackTags
 
 pytestmark = pytest.mark.skipif(
     shutil.which("ffmpeg") is None, reason="ffmpeg not installed"

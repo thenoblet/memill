@@ -17,8 +17,8 @@ from yt_dlp import YoutubeDL
 from yt_dlp.cookies import CookieLoadError
 from yt_dlp.utils import DownloadCancelled, YoutubeDLError
 
-from yt2mp3.config import Settings
-from yt2mp3.errors import DownloadError
+from memill.config import Settings
+from memill.errors import DownloadError
 
 YdlFactory = Callable[[dict[str, Any]], AbstractContextManager[Any]]
 

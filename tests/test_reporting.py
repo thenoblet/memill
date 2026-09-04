@@ -6,7 +6,7 @@ import time
 
 import pytest
 
-from yt2mp3.reporting import (
+from memill.reporting import (
     PHASE_DOWNLOAD,
     PHASE_ENCODE,
     PlainReporter,

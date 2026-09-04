@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from yt2mp3.config import (
+from memill.config import (
     CbrQuality,
     Settings,
     VbrQuality,

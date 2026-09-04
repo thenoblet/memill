@@ -9,27 +9,27 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import TextIO
 
-from yt2mp3 import __version__
-from yt2mp3.config import (
-    DEFAULT_DESTINATION,
+from memill import __version__
+from memill.config import (
     DEFAULT_STAGING_ROOT,
     CbrQuality,
     Settings,
     VbrQuality,
+    default_destination,
     plan_concurrency,
 )
-from yt2mp3.encoder import require_ffmpeg
-from yt2mp3.errors import DependencyError, Yt2Mp3Error
-from yt2mp3.pipeline import (
+from memill.encoder import require_ffmpeg
+from memill.errors import DependencyError, Yt2Mp3Error
+from memill.pipeline import (
     STATUS_DONE,
     STATUS_FAILED,
     STATUS_SKIPPED,
     BatchResult,
     run_batch,
 )
-from yt2mp3.reporting import select_reporter
-from yt2mp3.source import Downloader
-from yt2mp3.transfer import ARCHIVE_FILENAME, Archive
+from memill.reporting import select_reporter
+from memill.source import Downloader
+from memill.transfer import ARCHIVE_FILENAME, Archive
 
 # A second, friendlier gate in front of the validation config.py already does.
 # Reached first, so a typo becomes a usage message and exit 2 rather than the
@@ -108,7 +108,7 @@ def _existing_file(text: str) -> Path:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="yt2mp3",
+        prog="memill",
         description="Download YouTube audio and convert it to a tagged MP3 "
         "with ffmpeg.",
         epilog="Use this for content you have the rights to.",
@@ -123,7 +123,7 @@ def build_parser() -> argparse.ArgumentParser:
         "-o",
         "--output",
         type=_destination,
-        default=DEFAULT_DESTINATION,
+        default=None,
         help="destination directory",
     )
     parser.add_argument(
@@ -174,7 +174,7 @@ def build_parser() -> argparse.ArgumentParser:
 def settings_from_args(args: argparse.Namespace, *, cpu_count: int) -> Settings:
     jobs, fragments = plan_concurrency(args.jobs, cpu_count=cpu_count)
     return Settings(
-        destination=args.output,
+        destination=args.output or default_destination(),
         staging_root=DEFAULT_STAGING_ROOT,
         quality=(
             # `is not None`, not truthiness: an empty bitrate must reach

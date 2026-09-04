@@ -9,18 +9,18 @@ from typing import Any
 import pytest
 from yt_dlp.utils import DownloadCancelled
 
-from yt2mp3 import pipeline
-from yt2mp3.config import Settings, VbrQuality
-from yt2mp3.encoder import LOUDNORM
-from yt2mp3.errors import DownloadError, TransferError, Yt2Mp3Error
-from yt2mp3.naming import (
+from memill import pipeline
+from memill.config import Settings, VbrQuality
+from memill.encoder import LOUDNORM
+from memill.errors import DownloadError, TransferError, Yt2Mp3Error
+from memill.naming import (
     DEFAULT_MAX_STEM,
     KEPT_SOURCE_EXTENSION,
     MIN_STEM,
     WINDOWS_PATH_LIMIT,
     stem_budget,
 )
-from yt2mp3.pipeline import (
+from memill.pipeline import (
     STATUS_DONE,
     STATUS_FAILED,
     STATUS_SKIPPED,
@@ -30,8 +30,8 @@ from yt2mp3.pipeline import (
     run_batch,
     staging_dir,
 )
-from yt2mp3.source import SourceMedia, TrackRef
-from yt2mp3.transfer import Archive
+from memill.source import SourceMedia, TrackRef
+from memill.transfer import Archive
 
 REF = TrackRef(video_id="aaa", url="https://x/aaa", title="Some Mix", duration=12.0)
 
@@ -979,7 +979,7 @@ def test_a_repeated_video_id_is_processed_once(tmp_path: Path) -> None:
     ``staging_dir`` is keyed on the video id, so at the default ``jobs > 1``
     both refs clear the archive check before either records, and whichever
     finishes first rmtrees the other's working files mid-download. Nothing
-    upstream deduplicates: ``yt2mp3 URL URL``, a ``--from-file`` list with a
+    upstream deduplicates: ``memill URL URL``, a ``--from-file`` list with a
     repeat and a playlist holding the same video twice all reach here intact.
     """
     settings = make_settings(tmp_path, jobs=2)

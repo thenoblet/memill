@@ -4,8 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from yt2mp3.errors import TransferError
-from yt2mp3.naming import (
+from memill.errors import TransferError
+from memill.naming import (
     WINDOWS_PATH_LIMIT,
     TrackTags,
     infer_tags,

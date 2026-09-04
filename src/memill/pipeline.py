@@ -11,13 +11,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
-from yt2mp3.config import Settings
-from yt2mp3.encoder import build_encode_command, run_encode
-from yt2mp3.errors import TransferError, Yt2Mp3Error
-from yt2mp3.naming import KEPT_SOURCE_EXTENSION, infer_tags, output_stem, stem_budget
-from yt2mp3.reporting import PHASE_DOWNLOAD, PHASE_ENCODE, ProgressReporter
-from yt2mp3.source import SourceMedia, TrackRef
-from yt2mp3.transfer import Archive, publish
+from memill.config import Settings
+from memill.encoder import build_encode_command, run_encode
+from memill.errors import TransferError, Yt2Mp3Error
+from memill.naming import KEPT_SOURCE_EXTENSION, infer_tags, output_stem, stem_budget
+from memill.reporting import PHASE_DOWNLOAD, PHASE_ENCODE, ProgressReporter
+from memill.source import SourceMedia, TrackRef
+from memill.transfer import Archive, publish
 
 STATUS_DONE = "done"
 STATUS_SKIPPED = "skipped"
@@ -132,7 +132,7 @@ def staging_dir(root: Path, key: str) -> Iterator[Path]:
     The trade: every failed or interrupted track leaves a directory behind,
     roughly the size of one downloaded track each. Each is reclaimed by the
     next successful run of the same id, and all of them by ``make clean``,
-    which wipes ``~/.cache/yt2mp3``.
+    which wipes ``~/.cache/memill``.
 
     The key is refused rather than rewritten if it could name anything but a
     direct child of ``root``. This directory is handed to ``shutil.rmtree``,
@@ -259,7 +259,7 @@ def _unique_by_id(refs: Sequence[TrackRef]) -> list[TrackRef]:
     ``staging_dir`` is keyed on the video id, so two refs naming the same video
     share one scratch directory: at the default ``jobs > 1`` both clear the
     archive check before either records, and whichever finishes first rmtrees
-    the other's working files mid-download. Reachable from ``yt2mp3 URL URL``,
+    the other's working files mid-download. Reachable from ``memill URL URL``,
     a ``--from-file`` list with a repeat, or a playlist containing the same
     video twice -- and none of ``collect_urls``, ``expand`` or the archive
     deduplicates before this point.

@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from yt2mp3.errors import TransferError
+from memill.errors import TransferError
 
 DEFAULT_MAX_STEM = 150
 MIN_STEM = 16

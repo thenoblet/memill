@@ -11,19 +11,19 @@ from typing import TextIO
 
 import pytest
 
-from yt2mp3 import cli
-from yt2mp3.cli import build_parser, collect_urls, render_summary, settings_from_args
-from yt2mp3.config import CbrQuality, VbrQuality
-from yt2mp3.errors import DependencyError, DownloadError, TransferError
-from yt2mp3.pipeline import (
+from memill import cli
+from memill.cli import build_parser, collect_urls, render_summary, settings_from_args
+from memill.config import CbrQuality, VbrQuality
+from memill.errors import DependencyError, DownloadError, TransferError
+from memill.pipeline import (
     STATUS_DONE,
     STATUS_FAILED,
     STATUS_SKIPPED,
     BatchResult,
     TrackOutcome,
 )
-from yt2mp3.source import TrackRef
-from yt2mp3.transfer import ARCHIVE_FILENAME
+from memill.source import TrackRef
+from memill.transfer import ARCHIVE_FILENAME
 
 REF = TrackRef("aaa", "https://x/aaa", "Some Mix", 10.0)
 
@@ -152,9 +152,33 @@ def test_quality_and_bitrate_are_mutually_exclusive() -> None:
         parse("https://x/1", "-q", "2", "-b", "320k")
 
 
-def test_default_destination_is_the_windows_library() -> None:
+def test_the_default_destination_is_portable_not_personal() -> None:
+    """A published tool cannot assume anyone's mount points.
+
+    This replaced an assertion pinning one machine's Windows mount. Shipping
+    that default meant every other user's first run wrote somewhere that does
+    not exist on their system.
+    """
     settings = settings_from_args(parse("https://x/1"), cpu_count=8)
-    assert settings.destination == Path("/mnt/e/Media/Music/New")
+    assert settings.destination == Path.home() / "Music"
+
+
+def test_the_output_env_var_overrides_the_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MEMILL_OUTPUT", "/tmp/some/library")
+    settings = settings_from_args(parse("https://x/1"), cpu_count=8)
+    assert settings.destination == Path("/tmp/some/library")
+
+
+def test_an_explicit_output_still_beats_the_env_var(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("MEMILL_OUTPUT", "/tmp/ignored")
+    args = parse("https://x/1", "-o", str(tmp_path))
+    settings = settings_from_args(args, cpu_count=8)
+    assert settings.destination == tmp_path
+
 
 
 def test_output_flag_overrides_the_destination() -> None:
@@ -214,7 +238,7 @@ def usage_error(capsys: pytest.CaptureFixture[str], *argv: str) -> str:
         parse(*argv)
     assert caught.value.code == 2
     err = capsys.readouterr().err
-    assert err.startswith("usage: yt2mp3")
+    assert err.startswith("usage: memill")
     return err
 
 

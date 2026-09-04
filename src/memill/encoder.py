@@ -8,9 +8,9 @@ import tempfile
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
-from yt2mp3.config import Quality
-from yt2mp3.errors import DependencyError, EncodeError
-from yt2mp3.naming import TrackTags
+from memill.config import Quality
+from memill.errors import DependencyError, EncodeError
+from memill.naming import TrackTags
 
 COVER_SIZE = 600
 LOUDNORM = "loudnorm=I=-14:TP=-1.5:LRA=11"

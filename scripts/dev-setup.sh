@@ -16,11 +16,11 @@ fi
 ./.venv/bin/pip install --quiet -e ".[dev]"
 
 if ! command -v ffmpeg > /dev/null || ! command -v ffprobe > /dev/null; then
-    echo "warning: ffmpeg and ffprobe are not on PATH, and yt2mp3 needs both" >&2
+    echo "warning: ffmpeg and ffprobe are not on PATH, and memill needs both" >&2
 fi
 
-launcher="$PWD/.venv/bin/yt2mp3"
-link="$HOME/.local/bin/yt2mp3"
+launcher="$PWD/.venv/bin/memill"
+link="$HOME/.local/bin/memill"
 mkdir -p "$HOME/.local/bin"
 
 # Both sides resolved the same way. bash's $PWD is the *logical* path, so if
@@ -59,4 +59,4 @@ case ":$PATH:" in
     *) echo "note: $HOME/.local/bin is not on your PATH" >&2 ;;
 esac
 
-echo "run: yt2mp3 'https://youtube.com/watch?v=...'"
+echo "run: memill 'https://youtube.com/watch?v=...'"

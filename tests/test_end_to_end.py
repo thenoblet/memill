@@ -20,9 +20,9 @@ from typing import Any, NamedTuple
 
 import pytest
 
-from yt2mp3.config import VbrQuality
-from yt2mp3.encoder import build_encode_command, run_encode
-from yt2mp3.naming import TrackTags
+from memill.config import VbrQuality
+from memill.encoder import build_encode_command, run_encode
+from memill.naming import TrackTags
 
 pytestmark = pytest.mark.skipif(
     shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,

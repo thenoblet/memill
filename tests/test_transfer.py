@@ -7,8 +7,8 @@ from pathlib import Path
 
 import pytest
 
-from yt2mp3.errors import TransferError
-from yt2mp3.transfer import Archive, publish
+from memill.errors import TransferError
+from memill.transfer import Archive, publish
 
 
 def test_publish_moves_bytes_and_leaves_no_part_file(tmp_path: Path) -> None:

@@ -6,9 +6,9 @@ import shutil
 import threading
 from pathlib import Path
 
-from yt2mp3.errors import TransferError
+from memill.errors import TransferError
 
-ARCHIVE_FILENAME = ".yt2mp3-archive"
+ARCHIVE_FILENAME = ".memill-archive"
 
 
 def publish(source: Path, destination_dir: Path, filename: str) -> Path:

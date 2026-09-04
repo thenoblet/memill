@@ -4,9 +4,9 @@ from pathlib import Path
 
 import pytest
 
-from yt2mp3.config import CbrQuality, VbrQuality
-from yt2mp3.encoder import LOUDNORM, ProgressParser, build_encode_command
-from yt2mp3.naming import TrackTags
+from memill.config import CbrQuality, VbrQuality
+from memill.encoder import LOUDNORM, ProgressParser, build_encode_command
+from memill.naming import TrackTags
 
 AUDIO = Path("/stage/a.opus")
 OUT = Path("/stage/out.mp3")

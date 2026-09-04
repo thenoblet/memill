@@ -1,10 +1,10 @@
-# yt2mp3
+# memill
 
 Pull the audio out of a YouTube video and land a tagged, cover-arted MP3 in your
 music library. One command:
 
 ```bash
-yt2mp3 "https://youtube.com/watch?v=..."
+memill "https://youtube.com/watch?v=..."
 ```
 
 Use this for content you have the rights to.
@@ -14,14 +14,23 @@ Use this for content you have the rights to.
 Requires Python 3.11+ and ffmpeg (with `libmp3lame` and `mjpeg`).
 
 ```bash
-./setup.sh
+pipx install memill          # recommended: isolated, on PATH
+pip install memill           # or into your own environment
 ```
 
-That builds a virtualenv in `.venv`, installs the package into it along with the
-`[dev]` extra (pytest, mypy, ruff — what the Development commands below need),
-and links `~/.local/bin/yt2mp3` at the launcher. It is safe to re-run; if
-something unrelated already occupies that path it says so and stops rather than
-replacing it.
+From a clone:
+
+```bash
+pip install .
+```
+
+Set your library once instead of passing `-o` every time:
+
+```bash
+export MEMILL_OUTPUT=~/Music/Downloads
+```
+
+Without it, tracks land in `~/Music`.
 
 ## What it does
 
@@ -36,7 +45,7 @@ replacing it.
    by an atomic rename, so an interrupted run never leaves a truncated file
    wearing a finished name.
 
-Downloading and encoding happen on the Linux filesystem (`~/.cache/yt2mp3`), and
+Downloading and encoding happen on the Linux filesystem (`~/.cache/memill`), and
 only the finished file is written to the mounted Windows drive. The mount is a
 9p filesystem and is substantially slower than ext4 for both bulk writes and the
 many small writes a fragmented download makes — repeated benchmarking puts the
@@ -50,7 +59,7 @@ next run resumes from the partial file yt-dlp wrote there instead of starting
 the download again — a network blip at 81% of a three-hour mix should not cost
 81% of a three-hour mix. The price is roughly one track's worth of disk per
 unfinished track, reclaimed by the next successful run of the same track, or by
-deleting `~/.cache/yt2mp3`.
+deleting `~/.cache/memill`.
 
 Filenames are sanitised for NTFS rather than only for ext4, so a title that
 Linux would happily accept cannot fail on arrival at the Windows mount, long
@@ -61,7 +70,7 @@ after the expensive download has already happened.
 | Flag | Effect |
 |---|---|
 | `URL ...` | one or more video or playlist URLs; `-` reads them from stdin |
-| `-o, --output DIR` | destination (default `/mnt/e/Media/Music/New`) |
+| `-o, --output DIR` | destination (default `$MEMILL_OUTPUT`, else `~/Music`) |
 | `-j, --jobs N` | tracks in parallel; fragments per track are derived to hold ~8 sockets |
 | `-q, --quality 0..9` | LAME VBR level (default 0, roughly 245 kbps) |
 | `-b, --bitrate 320k` | constant bitrate instead — mutually exclusive with `-q` |
@@ -76,7 +85,7 @@ after the expensive download has already happened.
 | `--plain` | plain line-by-line output instead of live progress bars |
 | `--version` | print the version and exit |
 
-Finished tracks are recorded in `.yt2mp3-archive` in the destination directory,
+Finished tracks are recorded in `.memill-archive` in the destination directory,
 so re-running on a playlist skips what you already have. `--no-archive` turns
 that off.
 

@@ -6,12 +6,30 @@ is free to depend on it.
 
 from __future__ import annotations
 
+import os
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-DEFAULT_DESTINATION = Path("/mnt/e/Media/Music/New")
-DEFAULT_STAGING_ROOT = Path.home() / ".cache" / "yt2mp3"
+# A universal default: every desktop Linux and WSL install has ~/Music, and a
+# published tool cannot assume anyone else's mount points. Set MEMILL_OUTPUT to
+# point at your own library once instead of passing -o on every run.
+DEFAULT_DESTINATION = Path.home() / "Music"
+OUTPUT_ENV_VAR = "MEMILL_OUTPUT"
+
+
+def default_destination(environ: Mapping[str, str] | None = None) -> Path:
+    """Where tracks land unless ``-o`` overrides it.
+
+    Resolved at call time rather than import time so the environment can be
+    changed by a test, and so a shell that exports MEMILL_OUTPUT after the
+    package is imported still wins.
+    """
+    env = os.environ if environ is None else environ
+    configured = env.get(OUTPUT_ENV_VAR)
+    return Path(configured).expanduser() if configured else DEFAULT_DESTINATION
+DEFAULT_STAGING_ROOT = Path.home() / ".cache" / "memill"
 
 # Total concurrent HTTP connections. Four tracks times eight fragments is
 # thirty-two sockets, which is how you get throttled rather than how you go
