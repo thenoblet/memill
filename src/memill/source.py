@@ -21,6 +21,8 @@ from memill.config import Settings
 from memill.errors import DownloadError
 
 YdlFactory = Callable[[dict[str, Any]], AbstractContextManager[Any]]
+# Told ``(url, reason)`` for each URL ``expand`` skips rather than fails on.
+UrlErrorHandler = Callable[[str, str], None]
 
 _COVER_SUFFIXES = (".jpg", ".jpeg", ".webp", ".png")
 _HTTP_CHUNK_SIZE = 10 << 20  # 10 MiB; blunts YouTube's per-connection throttling.
@@ -119,7 +121,12 @@ def _default_factory(opts: dict[str, Any]) -> Iterator[YoutubeDL]:
         yield ydl
 
 
-def _as_float(value: Any) -> float | None:
+def as_float(value: Any) -> float | None:
+    """A yt-dlp numeric field as a float, or ``None`` if it is not one.
+
+    Public because the pipeline needs the identical coercion for the duration
+    it reads out of the info dict, and two copies of one rule drift apart.
+    """
     return float(value) if isinstance(value, (int, float)) else None
 
 
@@ -144,12 +151,30 @@ def _ref_from_entry(entry: Mapping[str, Any]) -> TrackRef | None:
         video_id=video_id,
         url=str(url) if url else f"https://www.youtube.com/watch?v={video_id}",
         title=str(entry.get("title") or video_id),
-        duration=_as_float(entry.get("duration")),
+        duration=as_float(entry.get("duration")),
     )
 
 
 class Downloader:
-    """Retrieves audio-only media, never video."""
+    """Retrieves the audio stream, falling back to a muxed file only if it must.
+
+    The format selector is ``bestaudio/best``, and both halves matter. The
+    first asks for an audio-only stream, which is what YouTube serves for
+    essentially every video and is the saving this tool exists for: the video
+    track is far larger than the audio it carries.
+
+    The second is a fallback, and it is not audio-only. A source that offers
+    no audio-only format at all -- some of yt-dlp's 1800+ extractors never do
+    -- yields a muxed audio+video file, downloaded whole; ffmpeg then maps
+    ``0:a:0`` out of it, so the MP3 that reaches the library is the same
+    either way, but the bytes on the wire are not.
+
+    Kept rather than tightened to ``bestaudio`` deliberately. Requiring an
+    audio-only format would turn every such source from "a bigger download"
+    into "no download", which is the worse outcome for the user actually
+    holding the URL, and the end-to-end suite already exercises a muxed input
+    for exactly this path.
+    """
 
     __slots__ = ("_factory", "_settings")
 
@@ -159,11 +184,21 @@ class Downloader:
         self._settings = settings
         self._factory: YdlFactory = ydl_factory or _default_factory
 
-    def expand(self, urls: Sequence[str]) -> list[TrackRef]:
+    def expand(
+        self, urls: Sequence[str], *, on_error: UrlErrorHandler | None = None
+    ) -> list[TrackRef]:
         """Resolve URLs to individual tracks without downloading anything.
 
         Flat extraction is cheap and gives an accurate total up front, which is
         what makes the batch progress bar honest from its first frame.
+
+        A URL that cannot be resolved is skipped, not fatal: ``--from-file``
+        with fifty links whose seventh is private must still download the other
+        forty-nine, the same rule ``process_track`` applies one track at a time.
+        Each failure is passed to ``on_error`` as ``(url, reason)`` so the
+        caller can say which link was dropped and why. If every URL fails,
+        there is nothing left to do and that is an error rather than a silent
+        empty run.
         """
         opts: dict[str, Any] = {
             "extract_flat": "in_playlist",
@@ -177,6 +212,8 @@ class Downloader:
             # too -- which is precisely the content the flag exists for.
             opts["cookiesfrombrowser"] = (self._settings.cookies_from_browser,)
         refs: list[TrackRef] = []
+        failures: list[str] = []
+        first: YoutubeDLError | None = None
         for url in urls:
             # yt-dlp raises its own hierarchy, whose DownloadError shares our
             # name but is unrelated to it. Unwrapped, an ordinary unavailable
@@ -195,9 +232,15 @@ class Downloader:
                 # resolution once, not repeat itself for every URL given.
                 raise
             except YoutubeDLError as exc:
-                raise DownloadError(
-                    f"could not resolve {url}: {_reason(exc, recorder)}"
-                ) from exc
+                reason = _reason(exc, recorder)
+                failures.append(f"could not resolve {url}: {reason}")
+                # The first one, not the last: it is the cause of the raise
+                # below, and a chained traceback should name the failure the
+                # message opens with.
+                first = first or exc
+                if on_error is not None:
+                    on_error(url, reason)
+                continue
             entries = info.get("entries") if isinstance(info, Mapping) else None
             candidates = entries if isinstance(entries, list) else [info]
             refs.extend(
@@ -206,6 +249,8 @@ class Downloader:
                 if isinstance(entry, Mapping)
                 and (ref := _ref_from_entry(entry)) is not None
             )
+        if failures and not refs:
+            raise DownloadError("; ".join(failures)) from first
         return refs
 
     def _download_opts(

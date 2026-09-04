@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import shutil
 import threading
+from contextlib import suppress
 from pathlib import Path
 
 from memill.errors import TransferError
@@ -19,15 +20,25 @@ def publish(source: Path, destination_dir: Path, filename: str) -> Path:
     interrupted, which would leave a truncated file wearing the real name and
     looking finished -- so the bytes land under ``.part`` first and are revealed
     by a rename, which within one filesystem is atomic.
+
+    The ``mkdir`` is inside the ``try`` with the copy, not before it. An absent
+    destination mount or an unwritable ``-o`` directory raises there, and a
+    bare ``OSError`` escaping this call flies past the pipeline's
+    ``Yt2Mp3Error`` handler and cancels every remaining track in the batch --
+    the same defect ``Archive.add`` already guards against below.
     """
-    destination_dir.mkdir(parents=True, exist_ok=True)
     final = destination_dir / filename
     partial = destination_dir / f"{filename}.part"
     try:
+        destination_dir.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source, partial)
         partial.replace(final)
     except OSError as exc:
-        partial.unlink(missing_ok=True)
+        # The cleanup can fail too -- a leftover .part in a directory that has
+        # since gone read-only -- and that second OSError must not replace the
+        # first one on its way out.
+        with suppress(OSError):
+            partial.unlink(missing_ok=True)
         raise TransferError(f"could not publish {filename}: {exc}") from exc
     return final
 

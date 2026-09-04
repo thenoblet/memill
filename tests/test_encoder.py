@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import subprocess
+import tempfile
 from pathlib import Path
 
 import pytest
 
 from memill.config import CbrQuality, VbrQuality
-from memill.encoder import LOUDNORM, ProgressParser, build_encode_command
+from memill.encoder import LOUDNORM, ProgressParser, build_encode_command, run_encode
+from memill.errors import EncodeError, Yt2Mp3Error
 from memill.naming import TrackTags
 
 AUDIO = Path("/stage/a.opus")
@@ -109,3 +112,43 @@ def test_end_marker_completes_even_without_a_known_duration() -> None:
 
 def test_unknown_duration_cannot_produce_a_fraction() -> None:
     assert ProgressParser(duration=None).feed("out_time_us=5000000") is None
+
+
+def test_a_launch_that_fails_raises_encode_error_not_a_bare_oserror() -> None:
+    """``require_ffmpeg`` closes the startup window, not the per-track one.
+
+    ffmpeg removed mid-run raises ``FileNotFoundError`` out of ``Popen``.
+    ``FileNotFoundError`` is not a ``Yt2Mp3Error``, so ``process_track`` never
+    catches it: it escapes through ``future.result()`` and cancels every
+    remaining track in the batch.
+    """
+    with pytest.raises(EncodeError, match="could not run ffmpeg") as excinfo:
+        run_encode(["definitely-not-ffmpeg-xyz"], duration=None)
+    assert isinstance(excinfo.value, Yt2Mp3Error)
+    assert isinstance(excinfo.value.__cause__, FileNotFoundError)
+
+
+def test_a_fork_refused_under_load_raises_encode_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A large ``-j`` can meet EAGAIN rather than a missing binary."""
+
+    def refuse(*_: object, **__: object) -> None:
+        raise BlockingIOError(11, "Resource temporarily unavailable")
+
+    monkeypatch.setattr(subprocess, "Popen", refuse)
+    with pytest.raises(EncodeError, match="could not run ffmpeg"):
+        run_encode(["ffmpeg"], duration=None)
+
+
+def test_a_scratch_file_that_cannot_be_made_raises_encode_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """stderr goes to a temporary file, and a full /tmp refuses to open one."""
+
+    def refuse(*_: object, **__: object) -> None:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(tempfile, "TemporaryFile", refuse)
+    with pytest.raises(EncodeError, match="could not run ffmpeg"):
+        run_encode(["ffmpeg"], duration=None)

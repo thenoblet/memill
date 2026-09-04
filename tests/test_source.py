@@ -129,7 +129,7 @@ def test_fetch_without_a_reported_file_is_an_error(tmp_path: Path) -> None:
         downloader.fetch(TrackRef("aaa", "https://x/aaa", "One", None), tmp_path)
 
 
-def test_download_options_carry_audio_only_format_and_the_fragment_budget(
+def test_download_options_prefer_audio_only_and_carry_the_fragment_budget(
     tmp_path: Path,
 ) -> None:
     captured: list[dict[str, Any]] = []
@@ -145,6 +145,12 @@ def test_download_options_carry_audio_only_format_and_the_fragment_budget(
     )
     downloader.fetch(TrackRef("aaa", "https://x/aaa", "One", None), staging)
     opts = captured[-1]
+    # "bestaudio" first, so YouTube's audio-only stream is what is fetched and
+    # the video track -- far larger than the audio it carries -- is never
+    # downloaded. The "/best" fallback is muxed, and is deliberate: a source
+    # publishing no audio-only format at all would otherwise fail outright
+    # rather than cost a bigger download. Both halves are documented in the
+    # Downloader docstring and the README, so both are pinned here.
     assert opts["format"] == "bestaudio/best"
     assert opts["concurrent_fragment_downloads"] == 4
     assert opts["noplaylist"] is True
@@ -725,3 +731,125 @@ def test_an_error_that_says_nothing_at_all_is_still_named(tmp_path: Path) -> Non
         downloader.fetch(TrackRef("aaa", "https://x/aaa", "One", None), tmp_path)
 
     assert str(excinfo.value) == "could not download https://x/aaa: YoutubeDLError"
+
+
+def per_url_factory(replies: dict[str, Any]):
+    """A factory answering each URL differently: an info dict, or an exception.
+
+    ``expand`` is handed a list, and the point of these tests is what happens
+    to the OTHER entries when one of them fails, which a single fixed reply
+    cannot express.
+    """
+
+    class FakeYDL:
+        def __init__(self, opts: dict[str, Any]) -> None:
+            self.opts = opts
+
+        def extract_info(self, url: str, download: bool = False) -> Any:
+            reply = replies[url]
+            if isinstance(reply, BaseException):
+                raise reply
+            return reply
+
+    @contextmanager
+    def factory(opts: dict[str, Any]) -> Iterator[FakeYDL]:
+        yield FakeYDL(opts)
+
+    return factory
+
+
+def test_one_unresolvable_url_does_not_abort_the_others(tmp_path: Path) -> None:
+    """--from-file with fifty links must not lose forty-nine to the seventh.
+
+    ``process_track``'s own docstring already states the rule for tracks: one
+    bad track in a hundred must not take the other ninety-nine with it.
+    Resolution had the opposite behaviour, and it runs before any of it.
+    """
+    downloader = Downloader(
+        make_settings(tmp_path),
+        ydl_factory=per_url_factory(
+            {
+                "https://x/good1": {"id": "aaa", "title": "One"},
+                "https://x/private": YtDlpDownloadError("Private video"),
+                "https://x/good2": {"id": "bbb", "title": "Two"},
+            }
+        ),
+    )
+
+    refs = downloader.expand(
+        ["https://x/good1", "https://x/private", "https://x/good2"]
+    )
+
+    assert [ref.video_id for ref in refs] == ["aaa", "bbb"]
+
+
+def test_each_skipped_url_is_reported_with_its_reason(tmp_path: Path) -> None:
+    """Skipping silently would leave the user with no idea what was dropped."""
+    downloader = Downloader(
+        make_settings(tmp_path),
+        ydl_factory=per_url_factory(
+            {
+                "https://x/private": YtDlpDownloadError("ERROR: Private video"),
+                "https://x/good": {"id": "aaa", "title": "One"},
+            }
+        ),
+    )
+    seen: list[tuple[str, str]] = []
+
+    refs = downloader.expand(
+        ["https://x/private", "https://x/good"],
+        on_error=lambda url, reason: seen.append((url, reason)),
+    )
+
+    assert [ref.video_id for ref in refs] == ["aaa"]
+    assert seen == [("https://x/private", "Private video")]
+
+
+def test_every_url_failing_is_still_an_error_not_an_empty_run(
+    tmp_path: Path,
+) -> None:
+    """Nothing resolved is a failure, not a silent success with no tracks."""
+    downloader = Downloader(
+        make_settings(tmp_path),
+        ydl_factory=per_url_factory(
+            {
+                "https://x/a": YtDlpDownloadError("Private video"),
+                "https://x/b": YtDlpDownloadError("Video unavailable"),
+            }
+        ),
+    )
+
+    with pytest.raises(DownloadError) as excinfo:
+        downloader.expand(["https://x/a", "https://x/b"])
+
+    # Both are named: the user cannot fix a list they cannot see.
+    assert str(excinfo.value) == (
+        "could not resolve https://x/a: Private video; "
+        "could not resolve https://x/b: Video unavailable"
+    )
+
+
+def test_a_run_level_abort_still_stops_resolution_at_the_first_url(
+    tmp_path: Path,
+) -> None:
+    """Skipping must not swallow the aborts that are meant to stop the run.
+
+    An unreadable cookie store would otherwise be reported once per URL and
+    then raised anyway, having tried all fifty.
+    """
+    replies: dict[str, Any] = {
+        "https://x/a": CookieLoadError("could not read the firefox cookie store"),
+        "https://x/b": {"id": "bbb", "title": "Two"},
+    }
+    downloader = Downloader(
+        make_settings(tmp_path), ydl_factory=per_url_factory(replies)
+    )
+    seen: list[tuple[str, str]] = []
+
+    with pytest.raises(CookieLoadError):
+        downloader.expand(
+            ["https://x/a", "https://x/b"],
+            on_error=lambda url, reason: seen.append((url, reason)),
+        )
+
+    assert seen == []

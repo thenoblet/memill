@@ -173,3 +173,49 @@ def test_a_failed_archive_write_does_not_claim_the_key_is_recorded(
     archive.add("aaa")
     assert "aaa" in archive
     assert (tmp_path / "locked" / "archive.txt").read_text() == "aaa\n"
+
+
+def test_an_uncreatable_destination_raises_transfer_error(tmp_path: Path) -> None:
+    """The ``mkdir`` has to be inside the ``try`` with the copy.
+
+    An absent destination mount, or ``-o`` into a directory the user cannot
+    write, raises ``PermissionError`` there. Outside our hierarchy it escapes
+    ``process_track``'s handler and cancels every remaining track in the batch.
+    """
+    if os.geteuid() == 0:
+        pytest.skip("root ignores directory permissions")
+    source = tmp_path / "a.mp3"
+    source.write_bytes(b"x")
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    locked.chmod(0o500)
+    try:
+        with pytest.raises(TransferError, match="could not publish") as excinfo:
+            publish(source, locked / "library", "a.mp3")
+        assert isinstance(excinfo.value.__cause__, OSError)
+    finally:
+        locked.chmod(0o700)
+
+
+def test_a_cleanup_that_fails_does_not_replace_the_real_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The unlink of the ``.part`` file can raise an OSError of its own.
+
+    Letting that one out reports the wrong failure -- and reports it as a bare
+    OSError, outside the contract, which is the whole defect being fixed here.
+    """
+    source = tmp_path / "s.mp3"
+    source.write_bytes(b"data")
+    destination = tmp_path / "library"
+
+    def failing_copyfile(*_: object, **__: object) -> None:
+        raise OSError("disk full")
+
+    def failing_unlink(*_: object, **__: object) -> None:
+        raise PermissionError("read-only file system")
+
+    monkeypatch.setattr(shutil, "copyfile", failing_copyfile)
+    monkeypatch.setattr(Path, "unlink", failing_unlink)
+    with pytest.raises(TransferError, match="disk full"):
+        publish(source, destination, "Song.mp3")
