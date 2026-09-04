@@ -4,6 +4,9 @@ The pipeline depends on the ``ProgressReporter`` protocol, never on rich. That
 keeps the orchestration testable with a list-appending fake, and means a
 non-interactive run degrades to plain lines instead of emitting terminal
 control codes into a log file.
+
+Warning: RichReporter replaces sys.stdout and sys.stderr process-wide while
+running. Use the context manager or call close() to restore them.
 """
 
 from __future__ import annotations
@@ -47,6 +50,12 @@ class PlainReporter:
         self._stream = stream
         self._labels: dict[str, str] = {}
 
+    def __enter__(self) -> PlainReporter:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
     def _write(self, message: str) -> None:
         self._stream.write(f"{message}\n")
         self._stream.flush()
@@ -73,18 +82,37 @@ class PlainReporter:
 
 
 class RichReporter:
-    """A live bar per in-flight track, plus one for the batch."""
+    """A live bar per in-flight track, plus one for the batch.
 
-    __slots__ = ("_overall", "_progress", "_tasks")
+    Warning: this reporter replaces sys.stdout and sys.stderr process-wide.
+    Always use the context manager or call close() to restore them.
+    """
+
+    __slots__ = ("_done", "_labels", "_overall", "_progress", "_tasks", "_total")
 
     def __init__(self, progress: Progress) -> None:
         self._progress = progress
         self._tasks: dict[str, TaskID] = {}
+        self._labels: dict[str, str] = {}
         self._overall: TaskID | None = None
+        self._total = 0
+        self._done = 0
         self._progress.start()
+
+    def __enter__(self) -> RichReporter:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
 
     @classmethod
     def for_stream(cls, stream: TextIO) -> RichReporter:
+        """Create a reporter for a stream.
+
+        Warning: the returned reporter replaces sys.stdout and sys.stderr
+        process-wide. Use it as a context manager or call close() when done
+        to restore them.
+        """
         return cls(
             Progress(
                 TextColumn("[bold blue]{task.fields[label]}", justify="left"),
@@ -97,18 +125,23 @@ class RichReporter:
         )
 
     def batch_started(self, total: int) -> None:
+        self._total = total
         self._overall = self._progress.add_task(
             "batch", total=total, label=f"0/{total} tracks"
         )
 
     def track_started(self, key: str, label: str) -> None:
+        self._labels[key] = label
         self._tasks[key] = self._progress.add_task(key, total=1.0, label=label)
 
     def track_phase(self, key: str, phase: str) -> None:
         task = self._tasks.get(key)
         if task is not None:
             marker = "↓" if phase == PHASE_DOWNLOAD else "♪"
-            self._progress.update(task, completed=0.0, label=f"{marker} {phase}")
+            # Keep the title. A bar reading only "downloading" never says which
+            # track is downloading, which is the one thing the user wants.
+            title = self._labels.get(key, key)
+            self._progress.update(task, completed=0.0, label=f"{marker} {title}")
 
     def track_progress(self, key: str, fraction: float) -> None:
         task = self._tasks.get(key)
@@ -117,11 +150,16 @@ class RichReporter:
 
     def track_finished(self, key: str, status: str, detail: str | None = None) -> None:
         task = self._tasks.pop(key, None)
-        if task is not None:
-            self._progress.update(task, completed=1.0, label=status)
-            self._progress.remove_task(task)
+        if task is None:
+            # Unknown or duplicate key: advancing here would over-count the batch.
+            return
+        self._labels.pop(key, None)
+        self._progress.remove_task(task)
+        self._done += 1
         if self._overall is not None:
-            self._progress.advance(self._overall)
+            self._progress.update(
+                self._overall, advance=1, label=f"{self._done}/{self._total} tracks"
+            )
 
     def close(self) -> None:
         self._progress.stop()
