@@ -31,6 +31,53 @@ from yt2mp3.reporting import select_reporter
 from yt2mp3.source import Downloader
 from yt2mp3.transfer import ARCHIVE_FILENAME, Archive
 
+# A second, friendlier gate in front of the validation config.py already does.
+# Reached first, so a typo becomes a usage message and exit 2 rather than the
+# traceback a raw ValueError out of Settings construction would produce. The
+# checks below defer to config.py wherever it already owns the rule, so the two
+# gates cannot drift apart and disagree about what is valid.
+
+
+def _vbr_level(text: str) -> int:
+    try:
+        level = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"expected an integer 0-9, got {text!r}"
+        ) from None
+    try:
+        return VbrQuality(level).level
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def _bitrate(text: str) -> str:
+    # Also rejects the empty string, which would otherwise be falsy at the
+    # `if args.bitrate` branch and silently fall through to VBR.
+    try:
+        return CbrQuality(text).bitrate
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def _job_count(text: str) -> int:
+    try:
+        jobs = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"expected a positive integer, got {text!r}"
+        ) from None
+    if jobs < 1:
+        raise argparse.ArgumentTypeError(f"jobs must be at least 1, got {jobs}")
+    return jobs
+
+
+def _existing_file(text: str) -> Path:
+    path = Path(text)
+    if not path.is_file():
+        raise argparse.ArgumentTypeError(f"no such file: {text}")
+    return path
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -53,15 +100,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="destination directory",
     )
     parser.add_argument(
-        "-j", "--jobs", type=int, default=None, help="tracks in parallel"
+        "-j", "--jobs", type=_job_count, default=None, help="tracks in parallel"
     )
 
     quality = parser.add_mutually_exclusive_group()
     quality.add_argument(
-        "-q", "--quality", type=int, default=None, help="LAME VBR level 0-9"
+        "-q", "--quality", type=_vbr_level, default=None, help="LAME VBR level 0-9"
     )
     quality.add_argument(
-        "-b", "--bitrate", default=None, help="constant bitrate, e.g. 320k"
+        "-b",
+        "--bitrate",
+        type=_bitrate,
+        default=None,
+        help="constant bitrate, e.g. 320k",
     )
 
     parser.add_argument("--normalize", action="store_true", help="apply loudnorm")
@@ -79,7 +130,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--cookies-from-browser", default=None, help="e.g. firefox, chrome"
     )
     parser.add_argument(
-        "--from-file", type=Path, default=None, help="file of URLs, one per line"
+        "--from-file",
+        type=_existing_file,
+        default=None,
+        help="file of URLs, one per line",
     )
     parser.add_argument(
         "--dry-run", action="store_true", help="list what would be fetched"
@@ -133,7 +187,9 @@ def collect_urls(args: argparse.Namespace, stdin: TextIO) -> list[str]:
 def render_summary(result: BatchResult, stream: TextIO) -> None:
     counts = dict.fromkeys((STATUS_DONE, STATUS_SKIPPED, STATUS_FAILED), 0)
     for outcome in result.outcomes:
-        counts[outcome.status] = counts.get(outcome.status, 0) + 1
+        # Direct subscript, not .get(): a status this summary cannot print
+        # must fail here rather than be counted into a key nobody reads.
+        counts[outcome.status] += 1
     stream.write(
         f"\n{counts[STATUS_DONE]} done, "
         f"{counts[STATUS_SKIPPED]} skipped, "
@@ -180,9 +236,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"{ref.video_id}  {ref.title}")
         return 0
 
-    archive = Archive(
-        settings.destination / ARCHIVE_FILENAME, enabled=settings.use_archive
-    )
+    archive_path = settings.destination / ARCHIVE_FILENAME
+    try:
+        archive = Archive(archive_path, enabled=settings.use_archive)
+    except (OSError, UnicodeDecodeError) as exc:
+        # This file lives in the user's library on an NTFS mount, so an
+        # unreadable or non-UTF-8 archive is a thing that happens, not a bug.
+        print(
+            f"error: could not read the archive {archive_path}: {exc}",
+            file=sys.stderr,
+        )
+        return 1
     reporter = select_reporter(stream=sys.stderr, force_plain=args.plain)
     interrupted = False
     aborted: str | None = None
@@ -208,11 +272,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         # a user who mistypes a browser name deserves one clear message rather
         # than a stack trace. Catching it here rather than naming the type
         # keeps yt-dlp's existence a fact only source.py knows.
-        aborted = f"error: {exc}"
+        #
+        # Named differently from the handler above on purpose: errors.py's
+        # contract is that a Yt2Mp3Error was anticipated and anything else is
+        # a bug, and flattening both into one message would report a genuine
+        # defect as though it were an ordinary bad URL.
+        aborted = f"error: unexpected {type(exc).__name__}: {exc}"
     finally:
-        # Nothing may be printed before this. A live rich display globally
-        # redirects sys.stdout AND sys.stderr, so a message written while it is
-        # running is swallowed instead of reaching the user.
+        # Nothing may be printed before this. A live rich display owns the
+        # terminal and proxies sys.stdout and sys.stderr: a full line written
+        # while it runs is re-rendered through the console -- re-wrapped to the
+        # console width and scrolled above the bars -- and a partial line is
+        # buffered and re-emitted only after close(), out of order. The message
+        # is not lost, but it is reshaped and resequenced, so it is written
+        # once the display has given the terminal back.
         reporter.close()
 
     if interrupted:

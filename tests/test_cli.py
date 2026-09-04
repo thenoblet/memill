@@ -12,7 +12,7 @@ import pytest
 from yt2mp3 import cli
 from yt2mp3.cli import build_parser, collect_urls, render_summary, settings_from_args
 from yt2mp3.config import CbrQuality, VbrQuality
-from yt2mp3.errors import DependencyError, DownloadError
+from yt2mp3.errors import DependencyError, DownloadError, TransferError
 from yt2mp3.pipeline import (
     STATUS_DONE,
     STATUS_FAILED,
@@ -21,6 +21,7 @@ from yt2mp3.pipeline import (
     TrackOutcome,
 )
 from yt2mp3.source import TrackRef
+from yt2mp3.transfer import ARCHIVE_FILENAME
 
 REF = TrackRef("aaa", "https://x/aaa", "Some Mix", 10.0)
 
@@ -187,6 +188,62 @@ def test_normalize_and_cookies_reach_the_settings() -> None:
     assert settings.cookies_from_browser == "firefox"
 
 
+def usage_error(capsys: pytest.CaptureFixture[str], *argv: str) -> str:
+    """Assert argv is refused at the parser: usage line, exit 2, no traceback."""
+    with pytest.raises(SystemExit) as caught:
+        parse(*argv)
+    assert caught.value.code == 2
+    err = capsys.readouterr().err
+    assert err.startswith("usage: yt2mp3")
+    assert "Traceback" not in err
+    return err
+
+
+def test_a_quality_level_above_nine_is_a_usage_error(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert "-q/--quality" in usage_error(capsys, "https://x/1", "-q", "12")
+
+
+def test_a_negative_quality_level_is_a_usage_error(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert "-q/--quality" in usage_error(capsys, "https://x/1", "-q", "-1")
+
+
+def test_the_quality_range_boundaries_are_still_accepted() -> None:
+    assert settings_from_args(parse("https://x/1", "-q", "0"), cpu_count=8).quality == (
+        VbrQuality(0)
+    )
+    assert settings_from_args(parse("https://x/1", "-q", "9"), cpu_count=8).quality == (
+        VbrQuality(9)
+    )
+
+
+def test_a_bitrate_without_its_k_is_a_usage_error(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert "-b/--bitrate" in usage_error(capsys, "https://x/1", "-b", "320")
+
+
+def test_an_empty_bitrate_is_a_usage_error_not_a_silent_fallback(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """`if args.bitrate` is a truthiness test, so "" would fall through to VBR."""
+    assert "-b/--bitrate" in usage_error(capsys, "https://x/1", "-b", "")
+
+
+def test_zero_jobs_is_a_usage_error(capsys: pytest.CaptureFixture[str]) -> None:
+    assert "-j/--jobs" in usage_error(capsys, "https://x/1", "-j", "0")
+
+
+def test_a_missing_url_file_is_a_usage_error(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    missing = tmp_path / "nope" / "urls.txt"
+    assert "--from-file" in usage_error(capsys, "-", "--from-file", str(missing))
+
+
 # --- URL collection ---------------------------------------------------------
 
 
@@ -246,6 +303,12 @@ def test_summary_names_every_failure_and_its_reason() -> None:
     assert "two" not in text.split("\n")[-2]
 
 
+def test_an_unrecognised_status_fails_loudly_rather_than_vanishing() -> None:
+    """A status added later must not be counted into a key nothing prints."""
+    with pytest.raises(KeyError):
+        render_summary(BatchResult((outcome("cancelled"),)), io.StringIO())
+
+
 def test_summary_of_an_empty_batch_is_all_zeroes() -> None:
     stream = io.StringIO()
     render_summary(BatchResult(), stream)
@@ -255,12 +318,14 @@ def test_summary_of_an_empty_batch_is_all_zeroes() -> None:
 # --- main: exit codes -------------------------------------------------------
 
 
-def test_missing_ffmpeg_exits_two(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_missing_ffmpeg_exits_two(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     def boom() -> None:
         raise DependencyError("ffmpeg is not on PATH")
 
     monkeypatch.setattr(cli, "require_ffmpeg", boom)
-    assert cli.main(["https://x/aaa"]) == 2
+    assert cli.main(["https://x/aaa", "-o", str(tmp_path)]) == 2
 
 
 def test_a_clean_run_exits_zero(
@@ -297,34 +362,36 @@ def test_an_interrupt_exits_one_hundred_and_thirty(
     assert cli.main(["https://x/aaa", "-o", str(tmp_path)]) == 130
 
 
-def test_no_urls_at_all_is_a_usage_error(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_no_urls_at_all_is_a_usage_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     monkeypatch.setattr(cli, "require_ffmpeg", lambda: None)
     with pytest.raises(SystemExit) as caught:
-        cli.main([])
+        cli.main(["-o", str(tmp_path)])
     assert caught.value.code == 2
 
 
 def test_an_empty_expansion_exits_one(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
     install(monkeypatch, refs=[])
-    assert cli.main(["https://x/aaa"]) == 1
+    assert cli.main(["https://x/aaa", "-o", str(tmp_path)]) == 1
     assert "nothing to download" in capsys.readouterr().err
 
 
 def test_a_failed_expansion_reports_one_line_and_exits_one(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
     install(monkeypatch, expand_error=DownloadError("could not resolve https://x/aaa"))
-    assert cli.main(["https://x/aaa"]) == 1
+    assert cli.main(["https://x/aaa", "-o", str(tmp_path)]) == 1
     assert capsys.readouterr().err == "error: could not resolve https://x/aaa\n"
 
 
 def test_a_foreign_expansion_error_is_reported_not_raised(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
     install(monkeypatch, expand_error=RuntimeError("could not read cookies"))
-    assert cli.main(["https://x/aaa"]) == 1
+    assert cli.main(["https://x/aaa", "-o", str(tmp_path)]) == 1
     assert "could not read cookies" in capsys.readouterr().err
 
 
@@ -342,7 +409,9 @@ def test_a_run_level_abort_reports_one_line_and_exits_one(
 
     monkeypatch.setattr(cli, "run_batch", boom)
     assert cli.main(["https://x/aaa", "-o", str(tmp_path)]) == 1
-    assert capsys.readouterr().err == "error: could not load cookies from fierfox\n"
+    assert capsys.readouterr().err == (
+        "error: unexpected RuntimeError: could not load cookies from fierfox\n"
+    )
 
 
 def test_our_own_error_out_of_run_batch_exits_one(
@@ -369,6 +438,38 @@ def test_a_run_level_abort_still_closes_the_reporter(
     monkeypatch.setattr(cli, "run_batch", boom)
     cli.main(["https://x/aaa", "-o", str(tmp_path)])
     assert reporter.closed == 1
+
+
+def test_an_unreadable_archive_reports_one_line_and_exits_one(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """The archive lives in the library on an NTFS mount; bad bytes happen."""
+    reporter = install(monkeypatch)
+    (tmp_path / ARCHIVE_FILENAME).write_bytes(b"\xff\xfe not utf-8\n")
+    monkeypatch.setattr(cli, "run_batch", lambda *a, **k: BatchResult())
+
+    assert cli.main(["https://x/aaa", "-o", str(tmp_path)]) == 1
+    err = capsys.readouterr().err
+    assert err.startswith(f"error: could not read the archive {tmp_path}")
+    assert "Traceback" not in err
+    # It failed before the display was opened, so there is nothing to close.
+    assert reporter.closed == 0
+
+
+def test_an_expected_failure_out_of_run_batch_is_not_labelled_a_bug(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """errors.py's contract: a Yt2Mp3Error was anticipated, anything else is a bug."""
+    install(monkeypatch)
+
+    def boom(*_: object, **__: object) -> BatchResult:
+        raise TransferError("read-only mount")
+
+    monkeypatch.setattr(cli, "run_batch", boom)
+    assert cli.main(["https://x/aaa", "-o", str(tmp_path)]) == 1
+    err = capsys.readouterr().err
+    assert err == "error: read-only mount\n"
+    assert "unexpected" not in err
 
 
 # --- main: nothing may be printed before the reporter is closed -------------
@@ -443,11 +544,11 @@ def test_the_summary_reaches_the_user_not_the_live_display(
 
 
 def test_dry_run_lists_tracks_and_downloads_nothing(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
     fetches: list[object] = []
     install(monkeypatch, fetches=fetches)
-    assert cli.main(["https://x/aaa", "--dry-run"]) == 0
+    assert cli.main(["https://x/aaa", "--dry-run", "-o", str(tmp_path)]) == 0
     assert "Some Mix" in capsys.readouterr().out
     assert fetches == []
 
