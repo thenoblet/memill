@@ -150,8 +150,12 @@ def settings_from_args(args: argparse.Namespace, *, cpu_count: int) -> Settings:
         destination=args.output,
         staging_root=DEFAULT_STAGING_ROOT,
         quality=(
+            # `is not None`, not truthiness: an empty bitrate must reach
+            # CbrQuality and be refused, not fall through to VBR. The parser
+            # already rejects it, but this function is public and reachable
+            # with a namespace the parser never built.
             CbrQuality(args.bitrate)
-            if args.bitrate
+            if args.bitrate is not None
             else VbrQuality(args.quality or 0)
         ),
         jobs=jobs,
@@ -279,13 +283,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         # defect as though it were an ordinary bad URL.
         aborted = f"error: unexpected {type(exc).__name__}: {exc}"
     finally:
-        # Nothing may be printed before this. A live rich display owns the
-        # terminal and proxies sys.stdout and sys.stderr: a full line written
-        # while it runs is re-rendered through the console -- re-wrapped to the
-        # console width and scrolled above the bars -- and a partial line is
-        # buffered and re-emitted only after close(), out of order. The message
-        # is not lost, but it is reshaped and resequenced, so it is written
-        # once the display has given the terminal back.
+        # Nothing may be printed before this. While the live display runs, rich
+        # replaces sys.stdout and sys.stderr with its own proxy, so anything
+        # written goes through the console and is re-rendered rather than
+        # delivered as written. Closing first keeps user-facing output verbatim.
         reporter.close()
 
     if interrupted:

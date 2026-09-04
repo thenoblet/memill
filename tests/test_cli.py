@@ -233,6 +233,14 @@ def test_an_empty_bitrate_is_a_usage_error_not_a_silent_fallback(
     assert "-b/--bitrate" in usage_error(capsys, "https://x/1", "-b", "")
 
 
+def test_an_empty_bitrate_in_a_namespace_raises_rather_than_selecting_vbr() -> None:
+    """settings_from_args is public: a caller can reach it without the parser."""
+    args = parse("https://x/1")
+    args.bitrate = ""
+    with pytest.raises(ValueError, match="320k"):
+        settings_from_args(args, cpu_count=8)
+
+
 def test_zero_jobs_is_a_usage_error(capsys: pytest.CaptureFixture[str]) -> None:
     assert "-j/--jobs" in usage_error(capsys, "https://x/1", "-j", "0")
 
