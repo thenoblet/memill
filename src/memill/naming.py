@@ -34,36 +34,69 @@ _RESERVED = frozenset(
 
 _PART_SUFFIX = ".part"  # transfer writes "<name>.mp3.part" before renaming
 
-# What --keep-source has to budget for. The stem is chosen before the download
-# finishes, so the source's real suffix is not knowable at the moment it is
-# needed: this is the longest plausible audio suffix rather than the actual one.
-# YouTube serves .webm and .opus; .flac and .weba turn up on other extractors,
-# and all four are five characters. Budgeting conservatively costs a character
-# of title on a deep destination path; budgeting the .mp3 that publish does NOT
-# use for this file produces a path over the NTFS limit that fails only after
-# the download has been paid for.
-KEPT_SOURCE_EXTENSION = ".webm"
+# ext4 and every other Linux filesystem limit ONE PATH COMPONENT to 255 bytes,
+# not 255 characters. A 150-character CJK or Cyrillic title is 450 bytes of
+# UTF-8 and cannot be written at all, so the track dies at the encode step --
+# after the download has been paid for, which is exactly what this module
+# exists to prevent. The suffixes the run appends are reserved here as well as
+# in stem_budget, because that budget counts characters and this one counts
+# bytes: the longest name a stem ever wears is "<stem>.webm.part", the kept
+# source mid-copy.
+NAME_BYTE_LIMIT = 255
+_LONGEST_SUFFIX = ".webm"
+DEFAULT_MAX_STEM_BYTES = NAME_BYTE_LIMIT - len(_LONGEST_SUFFIX) - len(_PART_SUFFIX)
 
 
-def sanitize_stem(stem: str, *, max_length: int = DEFAULT_MAX_STEM) -> str:
+def _truncate_bytes(text: str, limit: int) -> str:
+    """``text`` cut to ``limit`` UTF-8 bytes, never mid-character.
+
+    ``errors="ignore"`` drops the incomplete sequence the cut may leave rather
+    than turning it into a replacement character, so a truncated CJK title
+    ends on the last character that fully fits.
+    """
+    encoded = text.encode("utf-8")
+    if len(encoded) <= limit:
+        return text
+    return encoded[:limit].decode("utf-8", errors="ignore")
+
+
+def sanitize_stem(
+    stem: str,
+    *,
+    max_length: int = DEFAULT_MAX_STEM,
+    max_bytes: int = DEFAULT_MAX_STEM_BYTES,
+) -> str:
     """Return ``stem`` as a filename NTFS will accept, without its extension.
 
     Illegal characters become spaces rather than being deleted, so that
     ``Artist: Title`` keeps its word boundary instead of collapsing to
     ``ArtistTitle``. The runs of whitespace that produces are then collapsed.
+
+    Both budgets are enforced: ``max_length`` in characters, for the Windows
+    path limit, and ``max_bytes`` in UTF-8 bytes, for the per-component limit
+    every Linux filesystem imposes.
     """
     cleaned = _ILLEGAL.sub(" ", stem)
     cleaned = _WHITESPACE_RUN.sub(" ", cleaned).strip()
     cleaned = cleaned.rstrip(". ")
     if len(cleaned) > max_length:
-        cleaned = cleaned[:max_length].rstrip(". ")
+        cleaned = cleaned[:max_length]
+    cleaned = _truncate_bytes(cleaned, max_bytes).rstrip(". ")
     if not cleaned:
         return "untitled"
     # Guard AFTER truncation, not before: slicing a long name can land exactly
     # on a reserved device name, and a small max_length is the regime where
     # that becomes reachable.
-    if cleaned.upper() in _RESERVED:
-        cleaned = f"_{cleaned[: max_length - 1]}" if max_length > 1 else "untitled"
+    #
+    # The segment before the FIRST dot, not the whole stem: Windows reserves
+    # the device name whatever follows it, so "CON.txt" is refused by NTFS
+    # just as "CON" is -- and would be refused only on arrival at the mount,
+    # once the download has already been paid for.
+    if cleaned.partition(".")[0].upper() in _RESERVED:
+        if max_length <= 1 or max_bytes <= 1:
+            return "untitled"
+        head = _truncate_bytes(cleaned[: max_length - 1], max_bytes - 1)
+        cleaned = f"_{head}"
     return cleaned or "untitled"
 
 
@@ -139,10 +172,16 @@ def infer_tags(info: Mapping[str, Any], *, clean: bool = True) -> TrackTags:
     YouTube Music entries carry real ``track``/``artist`` fields and are trusted
     verbatim. Everything else is a guess built from the title and uploader, so
     ``clean=False`` turns the guessing off entirely.
+
+    The two explicit fields are trusted independently. An entry carrying
+    ``artist`` without ``track`` is ordinary on YouTube Music, and guarding the
+    ``Artist - Song`` split on the track alone let the split overwrite a real
+    artist with the channel name that happened to open the title.
     """
     explicit_track = _first_str(info, "track")
     title = explicit_track or _first_str(info, "title") or "untitled"
-    artist = _first_str(info, "artist", "creator")
+    explicit_artist = _first_str(info, "artist", "creator")
+    artist = explicit_artist
     if artist is None:
         uploader = _first_str(info, "uploader", "channel", "uploader_id")
         artist = _TOPIC_SUFFIX.sub("", uploader).strip() or None if uploader else None
@@ -154,7 +193,11 @@ def infer_tags(info: Mapping[str, Any], *, clean: bool = True) -> TrackTags:
         title = stripped or title
         match = _ARTIST_TITLE.match(title)
         if match:
-            artist = match.group("artist").strip()
+            # The title is still split -- "Some Channel - Song Name" names the
+            # song either way -- but the guessed artist only stands in when
+            # the entry named none.
+            if explicit_artist is None:
+                artist = match.group("artist").strip()
             title = match.group("title").strip()
 
     return TrackTags(

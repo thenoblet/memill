@@ -6,6 +6,8 @@ import pytest
 
 from memill.errors import TransferError
 from memill.naming import (
+    DEFAULT_MAX_STEM_BYTES,
+    NAME_BYTE_LIMIT,
     WINDOWS_PATH_LIMIT,
     TrackTags,
     infer_tags,
@@ -219,3 +221,81 @@ def test_raw_mode_still_normalizes_topic_suffix() -> None:
     )
     assert tags.title == "X (Official Video)"  # Title is verbatim (no cleaning)
     assert tags.artist == "Gyakie"  # But Topic suffix is still stripped
+
+
+@pytest.mark.parametrize(
+    ("stem", "expected"),
+    [
+        ("CON.txt", "_CON.txt"),
+        ("con.txt", "_con.txt"),
+        ("NUL.mp3.bak", "_NUL.mp3.bak"),
+        ("lpt9.live", "_lpt9.live"),
+    ],
+)
+def test_reserved_names_are_caught_before_the_first_dot(
+    stem: str, expected: str
+) -> None:
+    """Windows reserves the segment before the FIRST dot, extension and all.
+
+    ``CON.txt`` is refused by NTFS exactly as ``CON`` is, and the file this
+    tool writes would be ``CON.txt.mp3`` -- rejected on arrival at the mount,
+    after the download has already been paid for.
+    """
+    assert sanitize_stem(stem) == expected
+
+
+@pytest.mark.parametrize("stem", ["CONSOLE", "NULL.txt", "COM.txt", "LPT10.txt"])
+def test_a_name_that_merely_starts_like_a_device_is_left_alone(stem: str) -> None:
+    """The guard matches the whole first segment, not a prefix of it."""
+    assert sanitize_stem(stem) == stem
+
+
+def test_a_cjk_title_is_budgeted_in_bytes_not_characters() -> None:
+    """A Linux path component is limited to 255 BYTES, not 255 characters.
+
+    150 CJK characters are 450 bytes of UTF-8: the encode step cannot create
+    the file at all, and it fails there -- after the download.
+    """
+    stem = sanitize_stem("\u697d" * 150)
+    assert len(stem.encode("utf-8")) <= DEFAULT_MAX_STEM_BYTES
+    # The whole name, suffix included, has to fit the component limit.
+    assert len(f"{stem}.webm.part".encode()) <= NAME_BYTE_LIMIT
+
+
+def test_byte_truncation_never_splits_a_character() -> None:
+    """A cut mid-sequence would leave bytes no filesystem call can encode."""
+    stem = sanitize_stem("\u044f" * 200, max_bytes=101)
+    # Cyrillic is two bytes: an odd budget must round down, not tear.
+    assert stem == "\u044f" * 50
+    assert stem.encode("utf-8").decode("utf-8") == stem
+
+
+def test_an_ascii_title_is_untouched_by_the_byte_budget() -> None:
+    """The byte budget must not shorten names the character budget allows."""
+    assert sanitize_stem("A" * 150) == "A" * 150
+
+
+def test_an_explicit_artist_survives_a_channel_name_in_the_title() -> None:
+    """An entry with ``artist`` but no ``track`` is ordinary on YouTube Music.
+
+    Guarding the ``Artist - Song`` split on the track alone let the split
+    overwrite a real artist with the channel name that opened the title.
+    """
+    tags = infer_tags(
+        {
+            "artist": "Real Artist",
+            "title": "Some Channel - Song Name",
+            "uploader": "Some Channel",
+        }
+    )
+    assert tags.artist == "Real Artist"
+    # The title is still split: the song is named either way.
+    assert tags.title == "Song Name"
+
+
+def test_a_guessed_artist_is_still_replaced_by_the_split() -> None:
+    """The uploader is a guess, so the title's own artist outranks it."""
+    tags = infer_tags(
+        {"title": "Kofi Kinaata - Things Fall Apart", "uploader": "Some Channel"}
+    )
+    assert tags.artist == "Kofi Kinaata"

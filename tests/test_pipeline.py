@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -11,11 +12,10 @@ from yt_dlp.utils import DownloadCancelled
 
 from memill import pipeline
 from memill.config import Settings, VbrQuality
-from memill.encoder import LOUDNORM
+from memill.encoder import LOUDNORM, run_encode
 from memill.errors import DownloadError, TransferError, Yt2Mp3Error
 from memill.naming import (
     DEFAULT_MAX_STEM,
-    KEPT_SOURCE_EXTENSION,
     MIN_STEM,
     WINDOWS_PATH_LIMIT,
     stem_budget,
@@ -54,6 +54,7 @@ class FakeDownloader:
         info_extra: dict[str, Any] | None = None,
         cover: bool = False,
         delay: dict[str, float] | None = None,
+        suffix: str = ".opus",
     ) -> None:
         self.fail = fail
         self.fail_ids = set(fail_ids)
@@ -62,6 +63,9 @@ class FakeDownloader:
         self.info_extra = dict(info_extra or {})
         self.cover = cover
         self.delay = dict(delay or {})
+        # What YouTube served. The pipeline budgets the filename against the
+        # real suffix, so a test can vary it.
+        self.suffix = suffix
         self.calls: list[TrackRef] = []
         self.staging_seen: dict[str, Path] = {}
         self.staging_was_dir: list[bool] = []
@@ -97,7 +101,7 @@ class FakeDownloader:
                 raise self.cancel_error("user cancelled")
             if self.fail or ref.video_id in self.fail_ids:
                 raise DownloadError("network went away")
-            audio = staging / f"{ref.video_id}.opus"
+            audio = staging / f"{ref.video_id}{self.suffix}"
             audio.write_bytes(b"opus")
             cover: Path | None = None
             if self.cover:
@@ -1015,10 +1019,16 @@ def test_keep_source_still_fits_the_destination_path(tmp_path: Path) -> None:
     whatever YouTube served -- ``.webm`` or ``.opus``, 5 characters. At a
     binding budget that one extra character puts the ``.part`` form at 261
     with the NUL, over the limit, after the download has been paid for.
+
+    The suffix pinned here is the one the downloader really produced, because
+    that is the one the pipeline now budgets for: the download has already
+    happened by the time the budget is taken, so no conservative guess is
+    involved.
     """
     target_budget = 40
+    source_extension = ".opus"  # what FakeDownloader writes, as YouTube does
     # `used` inside stem_budget: destination + "/" + suffix + ".part" + NUL.
-    reserved = 1 + len(KEPT_SOURCE_EXTENSION) + len(".part") + 1
+    reserved = 1 + len(source_extension) + len(".part") + 1
     pad = WINDOWS_PATH_LIMIT - reserved - target_budget - len(str(tmp_path)) - 1
     destination = tmp_path / ("d" * pad)
     settings = make_settings(
@@ -1026,7 +1036,7 @@ def test_keep_source_still_fits_the_destination_path(tmp_path: Path) -> None:
     )
     # The premise: at this destination the two budgets genuinely differ, and
     # that single character is what crosses the limit.
-    assert stem_budget(destination, extension=KEPT_SOURCE_EXTENSION) == target_budget
+    assert stem_budget(destination, extension=source_extension) == target_budget
     assert stem_budget(destination) == target_budget + 1
 
     result = run_batch(
@@ -1079,3 +1089,140 @@ def test_an_unwritable_staging_root_fails_the_track_instead_of_the_run(
     assert result.outcomes[0].status == STATUS_FAILED
     assert "staging" in (result.outcomes[0].error or "")
     assert result.exit_code == 1
+
+
+def test_an_uncreatable_destination_fails_each_track_not_the_batch(
+    tmp_path: Path,
+) -> None:
+    """``publish`` must not let a bare ``OSError`` out of its ``mkdir``.
+
+    The destination mount going missing, or ``-o`` into a directory the user
+    cannot write, raises ``PermissionError``. Outside ``Yt2Mp3Error`` it
+    escapes ``process_track``, comes back out of ``future.result()`` and
+    cancels every track still queued -- so two tracks return no outcomes at
+    all instead of two failures.
+    """
+    if os.geteuid() == 0:
+        pytest.skip("root ignores directory permissions")
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    settings = make_settings(tmp_path, destination=locked / "library", jobs=1)
+    locked.chmod(0o500)
+    refs = [
+        TrackRef("aaa", "https://x/aaa", "One", 1.0),
+        TrackRef("bbb", "https://x/bbb", "Two", 1.0),
+    ]
+    try:
+        result = run_batch(
+            refs,
+            settings=settings,
+            downloader=FakeDownloader(),
+            reporter=RecordingReporter(),
+            archive=Archive(tmp_path / "a.txt"),
+            encode=fake_encode,
+        )
+    finally:
+        locked.chmod(0o700)
+
+    assert [outcome.status for outcome in result.outcomes] == [STATUS_FAILED] * 2
+    assert all("could not publish" in (o.error or "") for o in result.outcomes)
+
+
+def test_ffmpeg_vanishing_mid_run_fails_each_track_not_the_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``require_ffmpeg`` closes the startup window, not the per-track one.
+
+    Run with the real ``run_encode``, because the defect is inside it: a
+    ``FileNotFoundError`` out of ``Popen`` is not a ``Yt2Mp3Error``, so it
+    escapes the whole batch instead of failing one track.
+    """
+
+    def refuse(*_: object, **__: object) -> None:
+        raise FileNotFoundError(2, "No such file or directory", "ffmpeg")
+
+    monkeypatch.setattr(subprocess, "Popen", refuse)
+    refs = [
+        TrackRef("aaa", "https://x/aaa", "One", 1.0),
+        TrackRef("bbb", "https://x/bbb", "Two", 1.0),
+    ]
+    result = run_batch(
+        refs,
+        settings=make_settings(tmp_path, jobs=1),
+        downloader=FakeDownloader(),
+        reporter=RecordingReporter(),
+        archive=Archive(tmp_path / "a.txt"),
+        encode=run_encode,
+    )
+
+    assert [outcome.status for outcome in result.outcomes] == [STATUS_FAILED] * 2
+    assert all("could not run ffmpeg" in (o.error or "") for o in result.outcomes)
+
+
+def test_a_claimed_stem_is_never_a_name_windows_would_trim() -> None:
+    """``claim(".hack", max_length=3)`` used to return the bare marker " (2)".
+
+    The head truncated to ".", ``rstrip(". ")`` emptied it, and what was left
+    was a filename beginning with a space -- which Windows Explorer silently
+    trims, so the second track lands on the first one's name.
+    """
+    registry = StemRegistry()
+    first = registry.claim(".hack", max_length=3)
+    second = registry.claim(".hack", max_length=3)
+    third = registry.claim(".hack", max_length=3)
+
+    for name in (first, second, third):
+        assert name == name.strip(), f"{name!r} would be trimmed by Windows"
+        assert not name.endswith("."), f"{name!r} ends in a dot"
+        assert name, "an empty stem is not a filename"
+    assert len({first, second, third}) == 3
+
+
+def test_claiming_a_marker_never_yields_a_reserved_or_empty_head() -> None:
+    """The head is re-sanitised, not merely re-sliced."""
+    registry = StemRegistry()
+    registry.claim("CON", max_length=8)
+    assert registry.claim("CON", max_length=8) == "_CON (2)"
+
+    empty = StemRegistry()
+    empty.claim("...", max_length=8)
+    assert empty.claim("...", max_length=8).strip() != ""
+
+
+def test_keep_source_budgets_the_real_suffix_not_a_guess(tmp_path: Path) -> None:
+    """The budget is taken AFTER the download, so the suffix is known.
+
+    It used to assume the longest plausible one (``.webm``, five characters),
+    which costs a character of title on every ``--keep-source`` run whose
+    source is shorter -- and at a binding budget that character is the title's
+    last one.
+    """
+    target_budget = 40
+    source_extension = ".m4a"  # four characters, like the .mp3 beside it
+    reserved = 1 + len(".mp3") + len(".part") + 1
+    pad = WINDOWS_PATH_LIMIT - reserved - target_budget - len(str(tmp_path)) - 1
+    destination = tmp_path / ("d" * pad)
+    settings = make_settings(
+        tmp_path, destination=destination, jobs=1, keep_source=True
+    )
+    # The premise: guessing ".webm" here would cost exactly one character.
+    assert stem_budget(destination, extension=source_extension) == target_budget
+    assert stem_budget(destination, extension=".webm") == target_budget - 1
+
+    result = run_batch(
+        [TrackRef("aaa", "https://x/aaa", "L" * 200, 1.0)],
+        settings=settings,
+        downloader=FakeDownloader(suffix=source_extension),
+        reporter=RecordingReporter(),
+        archive=Archive(tmp_path / "a.txt"),
+        encode=fake_encode,
+    )
+    assert result.outcomes[0].status == STATUS_DONE
+
+    names = sorted(path.name for path in destination.iterdir())
+    assert [Path(name).suffix for name in names] == [".m4a", ".mp3"]
+    for name in names:
+        assert len(Path(name).stem) == target_budget
+        assert (
+            len(str(destination)) + 1 + len(name) + len(".part") < WINDOWS_PATH_LIMIT
+        )

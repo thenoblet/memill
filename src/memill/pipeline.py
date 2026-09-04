@@ -14,9 +14,15 @@ from typing import Any, Protocol
 from memill.config import Settings
 from memill.encoder import build_encode_command, run_encode
 from memill.errors import TransferError, Yt2Mp3Error
-from memill.naming import KEPT_SOURCE_EXTENSION, infer_tags, output_stem, stem_budget
+from memill.naming import (
+    DEFAULT_MAX_STEM_BYTES,
+    infer_tags,
+    output_stem,
+    sanitize_stem,
+    stem_budget,
+)
 from memill.reporting import PHASE_DOWNLOAD, PHASE_ENCODE, ProgressReporter
-from memill.source import SourceMedia, TrackRef
+from memill.source import SourceMedia, TrackRef, as_float
 from memill.transfer import Archive, publish
 
 STATUS_DONE = "done"
@@ -78,12 +84,26 @@ class StemRegistry:
 
         Case-folded: the destination is an NTFS mount, where two stems
         differing only in case are the same file.
+
+        The re-truncated head goes back through ``sanitize_stem``, because
+        truncation can leave one that is not a filename: ``claim(".hack",
+        max_length=3)`` cut the head to ``"."``, which ``rstrip(". ")`` emptied,
+        and returned the bare marker ``" (2)"`` -- a name Windows Explorer
+        silently trims the leading space off, so two tracks land on one file.
+        The marker itself is never truncated: it is the only thing making the
+        name unique, and cutting it would let the loop spin forever handing out
+        the same candidate.
         """
         with self._lock:
             candidate, suffix = stem, 2
             while candidate.casefold() in self._claimed:
                 marker = f" ({suffix})"
-                head = stem[: max(1, max_length - len(marker))].rstrip(". ")
+                room = max(1, max_length - len(marker))
+                head = sanitize_stem(
+                    stem[:room],
+                    max_length=room,
+                    max_bytes=max(1, DEFAULT_MAX_STEM_BYTES - len(marker)),
+                )
                 candidate = f"{head}{marker}"
                 suffix += 1
             self._claimed.add(candidate.casefold())
@@ -152,23 +172,18 @@ def staging_dir(root: Path, key: str) -> Iterator[Path]:
         raise TransferError(
             f"could not create the staging directory {path}: {exc}"
         ) from exc
-    try:
-        yield path
-    except BaseException:
-        # BaseException, not Exception: Ctrl-C mid-download is the case that
-        # most wants a resumable .part file. Both clauses do the same thing
-        # here -- the removal lives in the else -- but naming it says the
-        # interrupted run was considered, not overlooked.
-        raise
-    else:
-        shutil.rmtree(path, ignore_errors=True)
+    yield path
+    # Reached on success only, and no try/except is needed to arrange that: a
+    # generator-based context manager whose ``yield`` raised is never resumed,
+    # so a failed or interrupted track never runs this line and keeps the
+    # directory the retry resumes from. Ctrl-C included -- KeyboardInterrupt is
+    # not an Exception, and it is the case that most wants the .part file.
+    shutil.rmtree(path, ignore_errors=True)
 
 
 def _duration_of(ref: TrackRef, info: Mapping[str, Any]) -> float | None:
-    if ref.duration:
-        return ref.duration
-    value = info.get("duration")
-    return float(value) if isinstance(value, (int, float)) else None
+    """The ref's duration, or the info dict's if resolution never had one."""
+    return ref.duration or as_float(info.get("duration"))
 
 
 def process_track(
@@ -212,11 +227,16 @@ def process_track(
             # the longer suffix. --keep-source publishes "<stem><source suffix>"
             # alongside "<stem>.mp3", and YouTube audio arrives as .webm/.opus
             # -- one character more than the .mp3 the budget would otherwise
-            # assume, which is enough to cross the 260-char NTFS limit.
+            # assume, which is enough to cross the 260-char NTFS limit. The
+            # download has already happened here, so the real suffix is in hand
+            # and no conservative guess is needed; ".mp3" still governs when it
+            # is the longer of the two.
             budget = stem_budget(
                 settings.destination,
                 extension=(
-                    KEPT_SOURCE_EXTENSION if settings.keep_source else ".mp3"
+                    max(".mp3", media.audio.suffix, key=len)
+                    if settings.keep_source
+                    else ".mp3"
                 ),
             )
             stem = registry.claim(
