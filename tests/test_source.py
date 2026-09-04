@@ -6,6 +6,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from yt_dlp.utils import DownloadError as YtDlpDownloadError
+from yt_dlp.utils import ExtractorError
 
 from yt2mp3 import source
 from yt2mp3.config import Settings, VbrQuality
@@ -76,6 +78,7 @@ def test_fetch_returns_the_path_yt_dlp_reported(tmp_path: Path) -> None:
     media = downloader.fetch(TrackRef("aaa", "https://x/aaa", "One", 10.0), staging)
     assert media.audio == audio
     assert media.cover is None
+    assert media.info["id"] == "aaa"
 
 
 def test_fetch_finds_the_thumbnail_next_to_the_audio(tmp_path: Path) -> None:
@@ -122,6 +125,14 @@ def test_download_options_carry_audio_only_format_and_the_fragment_budget(
     # ffmpeg is ours: yt-dlp must hand us the raw stream, unprocessed.
     assert opts["postprocessors"] == []
     assert opts["outtmpl"] == {"default": str(staging / "%(id)s.%(ext)s")}
+    # Silence is not cosmetic: yt-dlp's own progress bar would be drawn
+    # straight over the Rich live display.
+    assert opts["quiet"] is True
+    assert opts["noprogress"] is True
+    assert opts["no_warnings"] is True
+    assert opts["retries"] == 5
+    assert opts["fragment_retries"] == 5
+    assert opts["socket_timeout"] == 20
 
 
 class SpySession:
@@ -151,7 +162,7 @@ class SpySession:
 
     def extract_info(self, url: str, download: bool = False) -> Any:
         self._calls.append({"url": url, "download": download})
-        return self._info
+        return self._info(url) if callable(self._info) else self._info
 
 
 class SpyFactory:
@@ -191,16 +202,24 @@ def test_expand_drops_entries_without_a_usable_id(tmp_path: Path) -> None:
 
 
 def test_expand_extracts_flat_and_downloads_nothing(tmp_path: Path) -> None:
-    spy = SpyFactory({"id": "aaa", "title": "One", "webpage_url": "https://x/aaa"})
+    def one_video(url: str) -> dict[str, Any]:
+        return {"id": url.rsplit("/", 1)[-1], "title": "One", "webpage_url": url}
+
+    spy = SpyFactory(one_video)
     downloader = Downloader(make_settings(tmp_path), ydl_factory=spy)
 
-    downloader.expand(["https://x/a", "https://x/b"])
+    refs = downloader.expand(["https://x/a", "https://x/b"])
 
+    # Every URL's tracks accumulate; the last one does not replace the rest.
+    assert [ref.video_id for ref in refs] == ["a", "b"]
     assert [call["url"] for call in spy.calls] == ["https://x/a", "https://x/b"]
     assert [call["download"] for call in spy.calls] == [False, False]
     assert spy.sessions[0].opts["extract_flat"] == "in_playlist"
     assert spy.sessions[0].opts["skip_download"] is True
     assert [session.closed for session in spy.sessions] == [True, True]
+    # YoutubeDL writes its defaults into the dict it is given, so each session
+    # must get its own copy rather than one dict shared down the loop.
+    assert spy.sessions[0].opts is not spy.sessions[1].opts
 
 
 def test_expand_prefers_the_canonical_url_and_synthesizes_a_missing_one(
@@ -359,3 +378,67 @@ def test_the_default_factory_drives_youtube_dl_as_a_context_manager(
     assert [ref.video_id for ref in refs] == ["aaa"]
     assert built[0].opts["extract_flat"] == "in_playlist"
     assert built[0].closed is True
+
+
+def exploding_factory(error: BaseException):
+    """A ydl_factory whose session raises the given error when driven."""
+
+    class ExplodingSession:
+        def __enter__(self) -> ExplodingSession:
+            return self
+
+        def __exit__(self, *exc: object) -> bool:
+            return False
+
+        def extract_info(self, url: str, download: bool = False) -> Any:
+            raise error
+
+    def factory(opts: dict[str, Any]) -> ExplodingSession:
+        return ExplodingSession()
+
+    return factory
+
+
+def test_a_yt_dlp_failure_in_expand_becomes_our_download_error(tmp_path: Path) -> None:
+    """yt-dlp's DownloadError shares our name but is not our exception.
+
+    Unwrapped it sails past the pipeline's ``Yt2Mp3Error`` handler, so one
+    private video would kill the whole batch instead of failing one track.
+    """
+    boom = YtDlpDownloadError("Private video")
+    assert not isinstance(boom, DownloadError)
+    downloader = Downloader(
+        make_settings(tmp_path), ydl_factory=exploding_factory(boom)
+    )
+
+    with pytest.raises(DownloadError) as excinfo:
+        downloader.expand(["https://x/p"])
+
+    assert "https://x/p" in str(excinfo.value)
+    assert excinfo.value.__cause__ is boom
+
+
+def test_a_yt_dlp_failure_in_fetch_becomes_our_download_error(tmp_path: Path) -> None:
+    boom = YtDlpDownloadError("Video unavailable")
+    downloader = Downloader(
+        make_settings(tmp_path), ydl_factory=exploding_factory(boom)
+    )
+
+    with pytest.raises(DownloadError) as excinfo:
+        downloader.fetch(TrackRef("aaa", "https://x/aaa", "One", None), tmp_path)
+
+    assert "https://x/aaa" in str(excinfo.value)
+    assert excinfo.value.__cause__ is boom
+
+
+def test_every_yt_dlp_error_is_translated_not_just_download_error(
+    tmp_path: Path,
+) -> None:
+    """``YoutubeDLError`` is the base: extractor and geo failures count too."""
+    boom = ExtractorError("Unable to extract player response")
+    downloader = Downloader(
+        make_settings(tmp_path), ydl_factory=exploding_factory(boom)
+    )
+
+    with pytest.raises(DownloadError):
+        downloader.expand(["https://x/p"])

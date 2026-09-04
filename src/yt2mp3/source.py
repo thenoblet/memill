@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from yt_dlp import YoutubeDL
+from yt_dlp.utils import YoutubeDLError
 
 from yt2mp3.config import Settings
 from yt2mp3.errors import DownloadError
@@ -90,8 +91,17 @@ class Downloader:
         }
         refs: list[TrackRef] = []
         for url in urls:
-            with self._factory(opts) as ydl:
-                info = ydl.extract_info(url, download=False)
+            # yt-dlp raises its own hierarchy, whose DownloadError shares our
+            # name but is unrelated to it. Unwrapped, an ordinary unavailable
+            # video escapes past the pipeline's Yt2Mp3Error handler and kills
+            # the whole batch instead of failing one track. The dict is copied
+            # per iteration because YoutubeDL writes its defaults into the
+            # options it is handed.
+            try:
+                with self._factory(dict(opts)) as ydl:
+                    info = ydl.extract_info(url, download=False)
+            except YoutubeDLError as exc:
+                raise DownloadError(f"could not resolve {url}: {exc}") from exc
             entries = info.get("entries") if isinstance(info, Mapping) else None
             candidates = entries if isinstance(entries, list) else [info]
             refs.extend(
@@ -134,8 +144,11 @@ class Downloader:
         on_progress: Callable[[float], None] | None = None,
     ) -> SourceMedia:
         """Download one track's audio (and thumbnail) into ``staging``."""
-        with self._factory(self._download_opts(staging, on_progress)) as ydl:
-            info = ydl.extract_info(ref.url, download=True)
+        try:
+            with self._factory(self._download_opts(staging, on_progress)) as ydl:
+                info = ydl.extract_info(ref.url, download=True)
+        except YoutubeDLError as exc:
+            raise DownloadError(f"could not download {ref.url}: {exc}") from exc
         if not isinstance(info, Mapping):
             raise DownloadError(f"yt-dlp returned no metadata for {ref.url}")
         return SourceMedia(
