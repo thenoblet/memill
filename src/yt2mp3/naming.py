@@ -8,7 +8,10 @@ that can be exhaustively tested in microseconds.
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from yt2mp3.errors import TransferError
 
@@ -75,3 +78,82 @@ def stem_budget(
             f"{available} characters, need at least {MIN_STEM}"
         )
     return min(DEFAULT_MAX_STEM, available)
+
+
+# Trailing decoration that carries no information once the file is in a library.
+_NOISE = re.compile(
+    r"""\s*[\(\[]\s*
+        (?:official\s+(?:music\s+)?(?:video|audio|visuali[sz]er)
+          |official\s+lyrics?\s+video
+          |lyrics?(?:\s+video)?
+          |audio|visuali[sz]er|hd|hq|4k|remastered)
+        \s*[\)\]]\s*""",
+    re.IGNORECASE | re.VERBOSE,
+)
+_TOPIC_SUFFIX = re.compile(r"\s*-\s*topic\s*$", re.IGNORECASE)
+# Bounded on the left so a title that merely contains a dash late on is not
+# mistaken for an "Artist - Song" pair.
+_ARTIST_TITLE = re.compile("^(?P<artist>.{1,80}?)\\s+[-\u2013\u2014]\\s+(?P<title>.+)$")
+
+
+@dataclass(frozen=True, slots=True)
+class TrackTags:
+    """The ID3 fields we are prepared to assert. Everything else is dropped."""
+
+    title: str
+    artist: str | None = None
+    album: str | None = None
+    year: str | None = None
+    source_url: str | None = None
+
+
+def _first_str(info: Mapping[str, Any], *keys: str) -> str | None:
+    for key in keys:
+        value = info.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _year_of(info: Mapping[str, Any]) -> str | None:
+    release = info.get("release_year")
+    if isinstance(release, int):
+        return str(release)
+    upload = _first_str(info, "upload_date")
+    return upload[:4] if upload and len(upload) >= 4 else None
+
+
+def infer_tags(info: Mapping[str, Any], *, clean: bool = True) -> TrackTags:
+    """Derive ID3 tags from a yt-dlp info dict.
+
+    YouTube Music entries carry real ``track``/``artist`` fields and are trusted
+    verbatim. Everything else is a guess built from the title and uploader, so
+    ``clean=False`` turns the guessing off entirely.
+    """
+    explicit_track = _first_str(info, "track")
+    title = explicit_track or _first_str(info, "title") or "untitled"
+    artist = _first_str(info, "artist", "creator")
+    if artist is None:
+        uploader = _first_str(info, "uploader", "channel", "uploader_id")
+        artist = _TOPIC_SUFFIX.sub("", uploader).strip() or None if uploader else None
+
+    if clean and explicit_track is None:
+        title = _NOISE.sub(" ", title).strip()
+        match = _ARTIST_TITLE.match(title)
+        if match:
+            artist = match.group("artist").strip()
+            title = match.group("title").strip()
+
+    return TrackTags(
+        title=title,
+        artist=artist,
+        album=_first_str(info, "album", "playlist_title"),
+        year=_year_of(info),
+        source_url=_first_str(info, "webpage_url", "original_url"),
+    )
+
+
+def output_stem(tags: TrackTags, *, max_length: int = DEFAULT_MAX_STEM) -> str:
+    """Return the destination filename stem, already NTFS-safe."""
+    raw = f"{tags.artist} - {tags.title}" if tags.artist else tags.title
+    return sanitize_stem(raw, max_length=max_length)

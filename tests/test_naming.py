@@ -5,7 +5,14 @@ from pathlib import Path
 import pytest
 
 from yt2mp3.errors import TransferError
-from yt2mp3.naming import WINDOWS_PATH_LIMIT, sanitize_stem, stem_budget
+from yt2mp3.naming import (
+    WINDOWS_PATH_LIMIT,
+    TrackTags,
+    infer_tags,
+    output_stem,
+    sanitize_stem,
+    stem_budget,
+)
 
 
 def test_replaces_every_ntfs_illegal_character() -> None:
@@ -106,3 +113,74 @@ def test_stem_budget_respects_windows_limit() -> None:
     budget = stem_budget(dest)
     actual_path = len(str(dest)) + 1 + budget + len(".mp3.part")
     assert actual_path == WINDOWS_PATH_LIMIT - 1
+
+
+def test_prefers_explicit_music_metadata() -> None:
+    tags = infer_tags(
+        {
+            "track": "Sankofa",
+            "artist": "Gyakie",
+            "album": "Sankofa EP",
+            "release_year": 2021,
+            "webpage_url": "https://example.test/watch?v=1",
+        }
+    )
+    assert tags == TrackTags(
+        title="Sankofa",
+        artist="Gyakie",
+        album="Sankofa EP",
+        year="2021",
+        source_url="https://example.test/watch?v=1",
+    )
+
+
+def test_strips_topic_suffix_from_uploader() -> None:
+    tags = infer_tags({"title": "Sankofa", "uploader": "Gyakie - Topic"})
+    assert tags.artist == "Gyakie"
+
+
+def test_splits_artist_dash_title_and_drops_noise() -> None:
+    tags = infer_tags(
+        {
+            "title": "Kofi Kinaata - Things Fall Apart (Official Video)",
+            "uploader": "Chan",
+        }
+    )
+    assert tags.artist == "Kofi Kinaata"
+    assert tags.title == "Things Fall Apart"
+
+
+def test_mix_title_without_separator_keeps_uploader_as_artist() -> None:
+    tags = infer_tags(
+        {"title": "GHANA AFROBEAT 2026 HOT MIX VOL. 4", "uploader": "DJ Sedan"}
+    )
+    assert tags.artist == "DJ Sedan"
+    assert tags.title == "GHANA AFROBEAT 2026 HOT MIX VOL. 4"
+
+
+def test_raw_mode_leaves_the_title_verbatim() -> None:
+    info = {
+        "title": "Kofi Kinaata - Things Fall Apart (Official Video)",
+        "uploader": "Chan",
+    }
+    tags = infer_tags(info, clean=False)
+    assert tags.title == "Kofi Kinaata - Things Fall Apart (Official Video)"
+    assert tags.artist == "Chan"
+
+
+def test_year_falls_back_to_upload_date() -> None:
+    assert infer_tags({"title": "X", "upload_date": "20240711"}).year == "2024"
+
+
+def test_output_stem_joins_artist_and_title() -> None:
+    assert output_stem(TrackTags(title="Things Fall Apart", artist="Kofi Kinaata")) == (
+        "Kofi Kinaata - Things Fall Apart"
+    )
+
+
+def test_output_stem_without_artist_is_just_the_title() -> None:
+    assert output_stem(TrackTags(title="Some Mix")) == "Some Mix"
+
+
+def test_output_stem_is_ntfs_safe() -> None:
+    assert output_stem(TrackTags(title="A/B", artist="C:D")) == "C D - A B"
