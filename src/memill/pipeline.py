@@ -8,6 +8,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -315,19 +316,19 @@ def run_batch(
     # surface at once.
     pool = ThreadPoolExecutor(max_workers=settings.jobs)
     try:
-        futures = {
-            pool.submit(
-                process_track,
-                ref,
-                settings=settings,
-                downloader=downloader,
-                reporter=reporter,
-                archive=archive,
-                encode=encode,
-                stems=stems,
-            ): index
-            for index, ref in enumerate(queue)
-        }
+        # The five collaborators and the registry are identical for every
+        # track, so they are bound once here rather than restated at each
+        # submission.
+        track = partial(
+            process_track,
+            settings=settings,
+            downloader=downloader,
+            reporter=reporter,
+            archive=archive,
+            encode=encode,
+            stems=stems,
+        )
+        futures = {pool.submit(track, ref): index for index, ref in enumerate(queue)}
         # No `except BaseException: raise` clause is needed to reach the
         # cancellation: a finally runs for KeyboardInterrupt too, which the
         # narrower `except Exception` never would. Only a run-level abort can
