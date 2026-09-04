@@ -138,7 +138,10 @@ def infer_tags(info: Mapping[str, Any], *, clean: bool = True) -> TrackTags:
         artist = _TOPIC_SUFFIX.sub("", uploader).strip() or None if uploader else None
 
     if clean and explicit_track is None:
-        title = _NOISE.sub(" ", title).strip()
+        stripped = _NOISE.sub(" ", title).strip()
+        # If the title was nothing but decoration, the strip was wrong: keep
+        # what YouTube actually said rather than asserting an empty title.
+        title = stripped or title
         match = _ARTIST_TITLE.match(title)
         if match:
             artist = match.group("artist").strip()

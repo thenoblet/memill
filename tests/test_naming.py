@@ -184,3 +184,38 @@ def test_output_stem_without_artist_is_just_the_title() -> None:
 
 def test_output_stem_is_ntfs_safe() -> None:
     assert output_stem(TrackTags(title="A/B", artist="C:D")) == "C D - A B"
+
+
+def test_pure_decoration_title_preserved() -> None:
+    # When a title is entirely decoration, preserve it rather than
+    # asserting an empty title. Regression test for noise stripper edge case.
+    tags = infer_tags({"title": "(Official Video)"})
+    assert tags.title == "(Official Video)"
+    assert tags.title != ""
+
+
+def test_explicit_track_not_split_even_with_dash() -> None:
+    # Explicit track/artist fields from YouTube Music are trusted verbatim
+    # and must never be split on dashes, even if they contain one.
+    tags = infer_tags(
+        {
+            "track": "Intro - Reprise",
+            "artist": "Gyakie",
+            "uploader": "Some Channel",
+        }
+    )
+    assert tags.title == "Intro - Reprise"
+    assert tags.artist == "Gyakie"
+
+
+def test_raw_mode_still_normalizes_topic_suffix() -> None:
+    # clean=False disables title inference (e.g., no dash splitting),
+    # but still strips the "- Topic" channel suffix because that is
+    # channel-name normalisation, not inference: YouTube auto-generates
+    # "<Artist> - Topic" channels, and including it in ID3 is never useful.
+    tags = infer_tags(
+        {"title": "X (Official Video)", "uploader": "Gyakie - Topic"},
+        clean=False,
+    )
+    assert tags.title == "X (Official Video)"  # Title is verbatim (no cleaning)
+    assert tags.artist == "Gyakie"  # But Topic suffix is still stripped
