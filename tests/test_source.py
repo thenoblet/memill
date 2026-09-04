@@ -6,8 +6,9 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from yt_dlp.cookies import CookieLoadError
+from yt_dlp.utils import DownloadCancelled, ExtractorError, YoutubeDLError
 from yt_dlp.utils import DownloadError as YtDlpDownloadError
-from yt_dlp.utils import ExtractorError
 
 from yt2mp3 import source
 from yt2mp3.config import Settings, VbrQuality
@@ -129,10 +130,26 @@ def test_download_options_carry_audio_only_format_and_the_fragment_budget(
     # straight over the Rich live display.
     assert opts["quiet"] is True
     assert opts["noprogress"] is True
+    # Without this yt-dlp never writes a thumbnail, so _find_cover finds
+    # nothing and no cover art is ever embedded -- silently.
+    assert opts["writethumbnail"] is True
+    assert opts["http_chunk_size"] == 10 << 20
     assert opts["no_warnings"] is True
     assert opts["retries"] == 5
     assert opts["fragment_retries"] == 5
     assert opts["socket_timeout"] == 20
+
+
+# The keys a real YoutubeDL writes into the options dict it is handed.
+YT_DLP_INJECTED_KEYS = (
+    "compat_opts",
+    "forceprint",
+    "http_headers",
+    "js_runtimes",
+    "outtmpl",
+    "print_to_file",
+    "remote_components",
+)
 
 
 class SpySession:
@@ -149,6 +166,13 @@ class SpySession:
         self, opts: dict[str, Any], info: Any, calls: list[dict[str, Any]]
     ) -> None:
         self.opts = opts
+        # A real YoutubeDL writes its own defaults into the options dict it is
+        # handed, so the fake does too -- otherwise no test could tell a fresh
+        # copy from a copy of the previous session's polluted one. ``received``
+        # is the snapshot taken before that happens.
+        self.received = dict(opts)
+        for key in YT_DLP_INJECTED_KEYS:
+            opts.setdefault(key, "<default written in by yt-dlp>")
         self.closed = False
         self._info = info
         self._calls = calls
@@ -214,12 +238,22 @@ def test_expand_extracts_flat_and_downloads_nothing(tmp_path: Path) -> None:
     assert [ref.video_id for ref in refs] == ["a", "b"]
     assert [call["url"] for call in spy.calls] == ["https://x/a", "https://x/b"]
     assert [call["download"] for call in spy.calls] == [False, False]
-    assert spy.sessions[0].opts["extract_flat"] == "in_playlist"
-    assert spy.sessions[0].opts["skip_download"] is True
     assert [session.closed for session in spy.sessions] == [True, True]
-    # YoutubeDL writes its defaults into the dict it is given, so each session
-    # must get its own copy rather than one dict shared down the loop.
+
+    first = spy.sessions[0].received
+    assert first["extract_flat"] == "in_playlist"
+    assert first["skip_download"] is True
+    # Silence matters at this call site too: yt-dlp's own output would be drawn
+    # over the Rich live display while a playlist is being expanded.
+    assert first["quiet"] is True
+    assert first["no_warnings"] is True
+
+    # Each session gets a pristine copy of the options -- not the same dict,
+    # and not a copy of the previous session's, which yt-dlp has by then
+    # written its own defaults into.
     assert spy.sessions[0].opts is not spy.sessions[1].opts
+    assert spy.sessions[1].received == first
+    assert not set(spy.sessions[1].received) & set(YT_DLP_INJECTED_KEYS)
 
 
 def test_expand_prefers_the_canonical_url_and_synthesizes_a_missing_one(
@@ -442,3 +476,29 @@ def test_every_yt_dlp_error_is_translated_not_just_download_error(
 
     with pytest.raises(DownloadError):
         downloader.expand(["https://x/p"])
+
+
+def test_a_run_level_abort_is_not_demoted_to_a_per_track_failure(
+    tmp_path: Path,
+) -> None:
+    """CookieLoadError and DownloadCancelled must escape both call sites whole.
+
+    They are ``YoutubeDLError`` subclasses, so the general handler would wrap
+    them; yt-dlp re-raises them unconverted for the same reason we must. One
+    unreadable cookie store should stop the run once with a clear message, not
+    fail every track in the playlist with the same one.
+    """
+    for boom in (CookieLoadError("could not read the firefox cookie store"),
+                 DownloadCancelled("interrupted")):
+        assert isinstance(boom, YoutubeDLError)
+        downloader = Downloader(
+            make_settings(tmp_path), ydl_factory=exploding_factory(boom)
+        )
+
+        with pytest.raises(type(boom)) as expanded:
+            downloader.expand(["https://x/p"])
+        assert expanded.value is boom
+
+        with pytest.raises(type(boom)) as fetched:
+            downloader.fetch(TrackRef("aaa", "https://x/aaa", "One", None), tmp_path)
+        assert fetched.value is boom

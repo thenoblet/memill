@@ -13,7 +13,8 @@ from pathlib import Path
 from typing import Any
 
 from yt_dlp import YoutubeDL
-from yt_dlp.utils import YoutubeDLError
+from yt_dlp.cookies import CookieLoadError
+from yt_dlp.utils import DownloadCancelled, YoutubeDLError
 
 from yt2mp3.config import Settings
 from yt2mp3.errors import DownloadError
@@ -100,6 +101,11 @@ class Downloader:
             try:
                 with self._factory(dict(opts)) as ydl:
                     info = ydl.extract_info(url, download=False)
+            except (CookieLoadError, DownloadCancelled):
+                # Run-level aborts, not per-video failures: yt-dlp re-raises
+                # these unconverted too. A bad --cookies-from-browser must
+                # stop once, not fail every track with the same message.
+                raise
             except YoutubeDLError as exc:
                 raise DownloadError(f"could not resolve {url}: {exc}") from exc
             entries = info.get("entries") if isinstance(info, Mapping) else None
@@ -147,6 +153,8 @@ class Downloader:
         try:
             with self._factory(self._download_opts(staging, on_progress)) as ydl:
                 info = ydl.extract_info(ref.url, download=True)
+        except (CookieLoadError, DownloadCancelled):
+            raise
         except YoutubeDLError as exc:
             raise DownloadError(f"could not download {ref.url}: {exc}") from exc
         if not isinstance(info, Mapping):
