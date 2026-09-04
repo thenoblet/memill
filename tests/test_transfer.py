@@ -102,7 +102,16 @@ def test_a_disabled_archive_remembers_nothing(tmp_path: Path) -> None:
     assert not (tmp_path / "archive.txt").exists()
 
 
-def test_archive_is_safe_under_concurrent_writers(tmp_path: Path) -> None:
+def test_archive_survives_concurrent_writers(tmp_path: Path) -> None:
+    """Archive stays consistent under a thread pool like the one Task 10 uses.
+
+    This is a load smoke test, not proof of locking: the lock guards a
+    check-then-act race whose window is effectively unhittable under CPython's
+    GIL, so this test passes with the lock removed. It still catches gross
+    failures -- a shared buffer, a non-append write, a missing flush, or an
+    exception raised under contention -- and the lock is kept because a
+    free-threaded build would expose the race this cannot reach.
+    """
     path = tmp_path / "archive.txt"
     archive = Archive(path)
 
