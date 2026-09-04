@@ -79,3 +79,33 @@ def build_encode_command(
     ]
     argv.append(str(output))
     return argv
+
+
+class ProgressParser:
+    """Turn ffmpeg's ``-progress`` key/value stream into a 0..1 fraction.
+
+    ffmpeg emits one ``key=value`` per line and terminates each block with
+    ``progress=continue`` or ``progress=end``. Only ``out_time_us`` carries
+    position, and it is meaningless without a duration -- which yt-dlp has
+    already told us, so we never pay for a separate ffprobe call.
+    """
+
+    __slots__ = ("_duration_us",)
+
+    def __init__(self, duration: float | None) -> None:
+        self._duration_us = duration * 1_000_000 if duration and duration > 0 else None
+
+    def feed(self, line: str) -> float | None:
+        """Return the new fraction if this line moved it, else ``None``."""
+        key, separator, value = line.strip().partition("=")
+        if not separator:
+            return None
+        if key == "progress" and value == "end":
+            return 1.0
+        if key != "out_time_us" or self._duration_us is None:
+            return None
+        try:
+            elapsed_us = float(value)
+        except ValueError:
+            return None
+        return min(1.0, max(0.0, elapsed_us / self._duration_us))

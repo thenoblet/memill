@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from yt2mp3.config import CbrQuality, VbrQuality
-from yt2mp3.encoder import build_encode_command
+from yt2mp3.encoder import ProgressParser, build_encode_command
 from yt2mp3.naming import TrackTags
 
 AUDIO = Path("/stage/a.opus")
@@ -67,3 +69,30 @@ def test_absent_tags_are_omitted_entirely() -> None:
 
 def test_output_is_the_final_argument() -> None:
     assert _cmd()[-1] == str(OUT)
+
+
+def test_out_time_becomes_a_fraction_of_the_duration() -> None:
+    parser = ProgressParser(duration=100.0)
+    assert parser.feed("out_time_us=50000000") == pytest.approx(0.5)
+
+
+def test_unrelated_keys_report_nothing() -> None:
+    assert ProgressParser(duration=100.0).feed("bitrate=245.0kbits/s") is None
+
+
+def test_malformed_lines_are_ignored_rather_than_raising() -> None:
+    parser = ProgressParser(duration=100.0)
+    assert parser.feed("out_time_us=") is None
+    assert parser.feed("garbage") is None
+
+
+def test_overrun_is_clamped_to_one() -> None:
+    assert ProgressParser(duration=10.0).feed("out_time_us=20000000") == 1.0
+
+
+def test_end_marker_completes_even_without_a_known_duration() -> None:
+    assert ProgressParser(duration=None).feed("progress=end") == 1.0
+
+
+def test_unknown_duration_cannot_produce_a_fraction() -> None:
+    assert ProgressParser(duration=None).feed("out_time_us=5000000") is None
