@@ -84,12 +84,17 @@ class Downloader:
         Flat extraction is cheap and gives an accurate total up front, which is
         what makes the batch progress bar honest from its first frame.
         """
-        opts = {
+        opts: dict[str, Any] = {
             "extract_flat": "in_playlist",
             "skip_download": True,
             "quiet": True,
             "no_warnings": True,
         }
+        if self._settings.cookies_from_browser:
+            # Resolution runs BEFORE any download, so an age-restricted or
+            # members-only URL fails here unless the cookies reach this step
+            # too -- which is precisely the content the flag exists for.
+            opts["cookiesfrombrowser"] = (self._settings.cookies_from_browser,)
         refs: list[TrackRef] = []
         for url in urls:
             # yt-dlp raises its own hierarchy, whose DownloadError shares our
@@ -103,8 +108,8 @@ class Downloader:
                     info = ydl.extract_info(url, download=False)
             except (CookieLoadError, DownloadCancelled):
                 # Run-level aborts, not per-video failures: yt-dlp re-raises
-                # these unconverted too. A bad --cookies-from-browser must
-                # stop once, not fail every track with the same message.
+                # these unconverted too. An unreadable cookie store must stop
+                # resolution once, not repeat itself for every URL given.
                 raise
             except YoutubeDLError as exc:
                 raise DownloadError(f"could not resolve {url}: {exc}") from exc
@@ -154,6 +159,9 @@ class Downloader:
             with self._factory(self._download_opts(staging, on_progress)) as ydl:
                 info = ydl.extract_info(ref.url, download=True)
         except (CookieLoadError, DownloadCancelled):
+            # The same run-level aborts, on the path that runs once per track:
+            # a bad --cookies-from-browser must stop the run, not turn into N
+            # identical per-track failures.
             raise
         except YoutubeDLError as exc:
             raise DownloadError(f"could not download {ref.url}: {exc}") from exc

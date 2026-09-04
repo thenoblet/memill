@@ -352,6 +352,26 @@ def test_browser_cookies_are_passed_only_when_configured(tmp_path: Path) -> None
     assert with_cookies.sessions[0].opts["cookiesfrombrowser"] == ("firefox",)
 
 
+def test_expand_passes_browser_cookies_only_when_configured(tmp_path: Path) -> None:
+    """Resolution runs before any download, so the cookies must reach it too.
+
+    An age-restricted or members-only URL fails at expansion otherwise, which
+    is exactly the content ``--cookies-from-browser`` exists to unlock.
+    """
+    info = {"id": "aaa", "title": "One", "webpage_url": "https://x/aaa"}
+
+    plain = SpyFactory(info)
+    Downloader(make_settings(tmp_path), ydl_factory=plain).expand(["https://x/aaa"])
+    assert "cookiesfrombrowser" not in plain.sessions[0].received
+
+    with_cookies = SpyFactory(info)
+    Downloader(
+        make_settings(tmp_path, cookies_from_browser="firefox"),
+        ydl_factory=with_cookies,
+    ).expand(["https://x/aaa"])
+    assert with_cookies.sessions[0].received["cookiesfrombrowser"] == ("firefox",)
+
+
 def test_the_progress_hook_reports_the_fraction_downloaded(tmp_path: Path) -> None:
     staging, info = staged_audio(tmp_path)
     spy = SpyFactory(info)
