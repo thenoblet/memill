@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import shutil
+import subprocess
+import tempfile
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 from yt2mp3.config import Quality
+from yt2mp3.errors import DependencyError, EncodeError
 from yt2mp3.naming import TrackTags
 
 COVER_SIZE = 600
@@ -109,3 +114,53 @@ class ProgressParser:
         except ValueError:
             return None
         return min(1.0, max(0.0, elapsed_us / self._duration_us))
+
+
+_STDERR_TAIL_CHARS = 2000
+
+
+def require_ffmpeg() -> None:
+    """Fail early and clearly rather than at the end of a long download."""
+    for program in ("ffmpeg", "ffprobe"):
+        if shutil.which(program) is None:
+            raise DependencyError(f"{program} is not on PATH")
+
+
+def run_encode(
+    argv: Sequence[str],
+    *,
+    duration: float | None,
+    on_progress: Callable[[float], None] | None = None,
+) -> None:
+    """Run ffmpeg, streaming progress, raising ``EncodeError`` on failure.
+
+    stderr goes to a temporary file rather than a second pipe. Reading two pipes
+    from one thread deadlocks the moment either fills its buffer, and the usual
+    fixes (a reader thread, ``communicate``) would either add machinery or
+    discard the incremental progress this function exists to deliver.
+    """
+    parser = ProgressParser(duration)
+    with tempfile.TemporaryFile(
+        mode="w+", encoding="utf-8", errors="replace"
+    ) as stderr:
+        # argv is built by us from Path objects and never a shell string.
+        process = subprocess.Popen(
+            list(argv),
+            stdout=subprocess.PIPE,
+            stderr=stderr,
+            stdin=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+        )
+        # Popen is itself a context manager: it closes the pipes and waits, so
+        # there is no hand-rolled cleanup to get wrong on the error path.
+        with process:
+            for line in process.stdout or ():
+                fraction = parser.feed(line)
+                if fraction is not None and on_progress is not None:
+                    on_progress(fraction)
+
+        if process.returncode != 0:
+            stderr.seek(0)
+            detail = stderr.read().strip()[-_STDERR_TAIL_CHARS:]
+            raise EncodeError(f"ffmpeg exited {process.returncode}: {detail}")
