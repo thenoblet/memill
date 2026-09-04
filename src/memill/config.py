@@ -36,7 +36,13 @@ DEFAULT_STAGING_ROOT = Path.home() / ".cache" / "memill"
 # fast, so jobs and fragments are derived from one another to hold this line.
 CONNECTION_BUDGET = 8
 
-_BITRATE = re.compile(r"^\d{1,4}k$")
+# libmp3lame encodes 8-320 kbps and nothing outside it. "-b 512k" and "-b 0k"
+# both match the shape of a bitrate, so without the range check every track in
+# the run downloads in full and ffmpeg then refuses the encode. Checked here,
+# it costs a usage message instead of a playlist.
+_BITRATE = re.compile(r"^(?P<kbps>\d{1,4})k$")
+MIN_BITRATE_KBPS = 8
+MAX_BITRATE_KBPS = 320
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,8 +66,16 @@ class CbrQuality:
     bitrate: str
 
     def __post_init__(self) -> None:
-        if not _BITRATE.match(self.bitrate):
+        match = _BITRATE.match(self.bitrate)
+        if match is None:
             raise ValueError(f"bitrate must look like '320k', got {self.bitrate!r}")
+        kbps = int(match.group("kbps"))
+        if not MIN_BITRATE_KBPS <= kbps <= MAX_BITRATE_KBPS:
+            raise ValueError(
+                f"bitrate must be between {MIN_BITRATE_KBPS}k and "
+                f"{MAX_BITRATE_KBPS}k, what libmp3lame encodes, got "
+                f"{self.bitrate!r}"
+            )
 
     def ffmpeg_args(self) -> tuple[str, ...]:
         return ("-b:a", self.bitrate)

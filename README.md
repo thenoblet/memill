@@ -36,8 +36,12 @@ Without it, tracks land in `~/Music`.
 
 1. yt-dlp fetches the **audio-only** stream. A video track is far larger than
    the audio it carries, whatever resolution YouTube happens to serve, so
-   skipping it is the single biggest saving in the run -- and this never
-   downloads it.
+   skipping it is the single biggest saving in the run. The format selector is
+   `bestaudio/best`: for YouTube the first branch always matches and no video
+   is downloaded. The `best` fallback exists for a source that publishes no
+   audio-only format at all, where yt-dlp has nothing else to offer — that
+   downloads a muxed file, video included. The MP3 you get is the same; the
+   bandwidth is not.
 2. One ffmpeg pass encodes to MP3, writes ID3v2.3 tags (plus a v1 trailer for
    older players) and embeds the thumbnail as square cover art, centre-cropped
    from 16:9. Not three chained passes rewriting the file each time.

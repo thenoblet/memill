@@ -6,6 +6,7 @@ import io
 import os
 import sys
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from typing import TextIO
 
@@ -36,16 +37,30 @@ def fake_downloader(
     refs: list[TrackRef],
     fetches: list[object],
     *,
-    expand_error: Exception | None = None,
+    expand_error: BaseException | None = None,
+    expand_skips: tuple[tuple[str, str], ...] = (),
 ) -> type:
-    """A stand-in for ``cli.Downloader`` that records every fetch attempted."""
+    """A stand-in for ``cli.Downloader`` that records every fetch attempted.
+
+    ``expand_skips`` are the ``(url, reason)`` pairs the real ``expand`` hands
+    to its ``on_error`` callback for a URL it resolved past rather than failed
+    on -- the only way the CLI learns which link was dropped.
+    """
 
     class _Downloader:
         def __init__(self, *_: object, **__: object) -> None: ...
 
-        def expand(self, urls: list[str]) -> list[TrackRef]:
+        def expand(
+            self,
+            urls: list[str],
+            *,
+            on_error: Callable[[str, str], None] | None = None,
+        ) -> list[TrackRef]:
             if expand_error is not None:
                 raise expand_error
+            for url, reason in expand_skips:
+                assert on_error is not None, "the CLI must pass a handler"
+                on_error(url, reason)
             return list(refs)
 
         def fetch(self, *args: object, **__: object) -> None:
@@ -106,7 +121,8 @@ def install(
     *,
     refs: list[TrackRef] | None = None,
     fetches: list[object] | None = None,
-    expand_error: Exception | None = None,
+    expand_error: BaseException | None = None,
+    expand_skips: tuple[tuple[str, str], ...] = (),
 ) -> RecordingReporter:
     """Wire main() up to fakes: no ffmpeg, no network, no live display."""
     reporter = RecordingReporter()
@@ -118,6 +134,7 @@ def install(
             [REF] if refs is None else refs,
             [] if fetches is None else fetches,
             expand_error=expand_error,
+            expand_skips=expand_skips,
         ),
     )
 
@@ -706,3 +723,90 @@ def test_the_reporter_is_closed_exactly_once_on_a_clean_run(
     monkeypatch.setattr(cli, "run_batch", lambda *a, **k: BatchResult())
     cli.main(["https://x/aaa", "-o", str(tmp_path)])
     assert reporter.closed == 1
+
+
+# --- main: interrupts and validation ----------------------------------------
+
+
+def test_an_interrupt_while_resolving_exits_one_hundred_and_thirty(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    """Expanding a large channel takes minutes, so Ctrl-C lands here.
+
+    ``KeyboardInterrupt`` is a ``BaseException``: neither the ``Yt2Mp3Error``
+    handler nor the broad ``Exception`` one catches it, so it left the README's
+    documented 130 as a traceback instead.
+    """
+    install(monkeypatch, expand_error=KeyboardInterrupt())
+
+    assert cli.main(["https://x/aaa", "-o", str(tmp_path)]) == 130
+    assert "interrupted" in capsys.readouterr().err
+
+
+def test_an_interrupt_while_reading_stdin_exits_one_hundred_and_thirty(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    """``-`` reads stdin, which blocks until the writer says something."""
+    install(monkeypatch)
+
+    class Interrupting:
+        def read(self) -> str:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(sys, "stdin", Interrupting())
+    assert cli.main(["-", "-o", str(tmp_path)]) == 130
+    assert "interrupted" in capsys.readouterr().err
+
+
+def test_a_skipped_url_is_named_on_stderr_and_the_rest_still_run(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    """A URL dropped during resolution never reaches the batch summary."""
+    install(
+        monkeypatch,
+        expand_skips=(("https://x/private", "Private video"),),
+    )
+    monkeypatch.setattr(cli, "run_batch", lambda *a, **k: BatchResult())
+
+    assert cli.main(["https://x/private", "https://x/aaa", "-o", str(tmp_path)]) == 0
+    err = capsys.readouterr().err
+    assert "warning: skipping https://x/private: Private video" in err
+
+
+@pytest.mark.parametrize("bitrate", ["512k", "0k", "7k", "321k"])
+def test_a_bitrate_libmp3lame_cannot_encode_is_a_usage_error(bitrate: str) -> None:
+    """Rejected at the parser, so it costs a usage message, not a playlist.
+
+    Every one of these matches the shape of a bitrate. Left to ffmpeg, the
+    whole run downloads first and fails at the encode.
+    """
+    with pytest.raises(SystemExit) as excinfo:
+        parse("https://x/1", "-b", bitrate)
+    assert excinfo.value.code == 2
+
+
+@pytest.mark.parametrize("bitrate", ["8k", "128k", "320k"])
+def test_the_bitrates_libmp3lame_does_encode_are_accepted(bitrate: str) -> None:
+    assert settings_from_args(
+        parse("https://x/1", "-b", bitrate), cpu_count=8
+    ).quality == CbrQuality(bitrate)
+
+
+def test_a_relative_destination_is_resolved_before_it_is_measured(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``stem_budget`` measures this path against the 260-character limit.
+
+    A relative ``-o out`` measures 3 characters while the directory it names
+    may be 200 -- no protection at all, exactly where it is needed.
+    """
+    monkeypatch.chdir(tmp_path)
+    settings = settings_from_args(parse("https://x/1", "-o", "out"), cpu_count=8)
+    assert settings.destination.is_absolute()
+    assert settings.destination == (tmp_path / "out").resolve()

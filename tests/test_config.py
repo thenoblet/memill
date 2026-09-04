@@ -65,3 +65,19 @@ def test_settings_are_immutable() -> None:
     )
     with pytest.raises(AttributeError):
         settings.jobs = 9  # type: ignore[misc]
+
+
+@pytest.mark.parametrize("bitrate", ["512k", "0k", "7k", "321k", "9999k"])
+def test_cbr_rejects_a_rate_libmp3lame_cannot_encode(bitrate: str) -> None:
+    """MP3 is 8-320 kbps. Anything else matches the shape and fails in ffmpeg.
+
+    Left to the encoder, every track in the run downloads in full first, so the
+    range has to be refused where it costs a usage message instead.
+    """
+    with pytest.raises(ValueError, match="bitrate must be between 8k and 320k"):
+        CbrQuality(bitrate)
+
+
+@pytest.mark.parametrize("bitrate", ["8k", "32k", "128k", "320k"])
+def test_cbr_accepts_the_range_libmp3lame_does_encode(bitrate: str) -> None:
+    assert CbrQuality(bitrate).ffmpeg_args() == ("-b:a", bitrate)

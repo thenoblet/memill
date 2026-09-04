@@ -83,6 +83,9 @@ def _destination(text: str) -> Path:
     ``-o "~/music"`` and ``-o '~/music'`` reach argparse as a literal ``~``.
     Without this the run silently creates a directory actually named ``~`` in
     the working directory and puts the library there.
+
+    ``resolve`` is applied later, in ``settings_from_args``, so that it covers
+    the environment variable and the default as well as this flag.
     """
     return Path(text).expanduser()
 
@@ -174,7 +177,13 @@ def build_parser() -> argparse.ArgumentParser:
 def settings_from_args(args: argparse.Namespace, *, cpu_count: int) -> Settings:
     jobs, fragments = plan_concurrency(args.jobs, cpu_count=cpu_count)
     return Settings(
-        destination=args.output or default_destination(),
+        # Resolved, not merely expanded. ``stem_budget`` measures this path to
+        # decide how much of the title fits inside Windows' 260-character
+        # limit, and a relative "-o out" measures 3 characters while the real
+        # path it names may be 200 -- no protection at all, exactly where the
+        # protection is needed. One choke point, so the flag, MEMILL_OUTPUT and
+        # the default are all measured as what they actually name.
+        destination=(args.output or default_destination()).resolve(),
         staging_root=DEFAULT_STAGING_ROOT,
         quality=(
             # `is not None`, not truthiness: an empty bitrate must reach
@@ -215,6 +224,16 @@ def collect_urls(args: argparse.Namespace, stdin: TextIO) -> list[str]:
     return urls
 
 
+# The exit code the README documents for Ctrl-C, and the one message that
+# announces it, so every interruptible step reports it identically.
+INTERRUPT_EXIT = 130
+
+
+def _interrupted(stream: TextIO) -> int:
+    print("\ninterrupted", file=stream)
+    return INTERRUPT_EXIT
+
+
 def render_summary(result: BatchResult, stream: TextIO) -> None:
     counts = dict.fromkeys((STATUS_DONE, STATUS_SKIPPED, STATUS_FAILED), 0)
     for outcome in result.outcomes:
@@ -241,15 +260,32 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
-    urls = collect_urls(args, sys.stdin)
+    try:
+        urls = collect_urls(args, sys.stdin)
+    except KeyboardInterrupt:
+        # ``-`` reads stdin, which on a terminal or a FIFO blocks until the
+        # writer says something. Ctrl-C is the ordinary way out of that wait,
+        # and it must not be a traceback.
+        return _interrupted(sys.stderr)
     if not urls:
         parser.error("no URLs given")
 
     settings = settings_from_args(args, cpu_count=os.cpu_count() or 1)
     downloader = Downloader(settings)
 
+    def skipped(url: str, reason: str) -> None:
+        # Said as it happens, before the live display starts: a URL dropped
+        # here never reaches the batch summary, so this is the only place the
+        # user learns which link was skipped and why.
+        print(f"warning: skipping {url}: {reason}", file=sys.stderr)
+
     try:
-        refs = downloader.expand(urls)
+        refs = downloader.expand(urls, on_error=skipped)
+    except KeyboardInterrupt:
+        # KeyboardInterrupt is a BaseException, so neither handler below sees
+        # it. Expanding a large channel takes minutes, which is long enough
+        # for Ctrl-C to be the normal way to stop it.
+        return _interrupted(sys.stderr)
     except Yt2Mp3Error as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -317,8 +353,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         reporter.close()
 
     if interrupted:
-        print("\ninterrupted", file=sys.stderr)
-        return 130
+        return _interrupted(sys.stderr)
     if aborted is not None:
         print(aborted, file=sys.stderr)
         return 1
