@@ -60,13 +60,30 @@ class Archive:
             return key in self._seen
 
     def add(self, key: str) -> None:
-        """Record ``key`` as finished. Called only after the file is in place."""
+        """Record ``key`` as finished. Called only after the file is in place.
+
+        Two orderings matter here. The write is wrapped in ``TransferError``
+        because an unwritable archive is an expected failure -- a read-only
+        mount, a bad path -- and a bare ``PermissionError`` escaping this call
+        would fly past the pipeline's ``Yt2Mp3Error`` handler and abort a batch
+        whose files were all published successfully.
+
+        And ``_seen`` is updated only once the line is on disk. Marking it
+        first would leave this process believing a track is recorded when the
+        write failed, so a later duplicate would be skipped on the strength of
+        a record that does not exist.
+        """
         if not self._enabled:
             return
         with self._lock:
             if key in self._seen:
                 return
+            try:
+                self._path.parent.mkdir(parents=True, exist_ok=True)
+                with self._path.open("a", encoding="utf-8") as handle:
+                    handle.write(f"{key}\n")
+            except OSError as exc:
+                raise TransferError(
+                    f"could not record {key} in the archive {self._path}: {exc}"
+                ) from exc
             self._seen.add(key)
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            with self._path.open("a", encoding="utf-8") as handle:
-                handle.write(f"{key}\n")

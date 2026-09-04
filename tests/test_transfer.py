@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import os
 import shutil
 from pathlib import Path
 
@@ -130,3 +131,45 @@ def test_archive_survives_concurrent_writers(tmp_path: Path) -> None:
 
     reloaded = Archive(path)
     assert all(f"id-{w}-{i}" in reloaded for w in range(8) for i in range(200))
+
+
+def _locked_archive(tmp_path: Path) -> Archive:
+    """An archive whose parent directory refuses writes."""
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    archive = Archive(locked / "archive.txt")
+    locked.chmod(0o500)
+    return archive
+
+
+def test_an_unwritable_archive_raises_transfer_error(tmp_path: Path) -> None:
+    if os.geteuid() == 0:
+        pytest.skip("root ignores directory permissions")
+    archive = _locked_archive(tmp_path)
+    try:
+        # A bare PermissionError here escapes the pipeline's Yt2Mp3Error
+        # handler and aborts a batch whose files were all published.
+        with pytest.raises(TransferError, match="could not record"):
+            archive.add("aaa")
+    finally:
+        (tmp_path / "locked").chmod(0o700)
+
+
+def test_a_failed_archive_write_does_not_claim_the_key_is_recorded(
+    tmp_path: Path,
+) -> None:
+    if os.geteuid() == 0:
+        pytest.skip("root ignores directory permissions")
+    archive = _locked_archive(tmp_path)
+    try:
+        with pytest.raises(TransferError):
+            archive.add("aaa")
+        # Marking _seen before the write would leave this process believing a
+        # track is recorded when nothing reached disk.
+        assert "aaa" not in archive
+    finally:
+        (tmp_path / "locked").chmod(0o700)
+
+    archive.add("aaa")
+    assert "aaa" in archive
+    assert (tmp_path / "locked" / "archive.txt").read_text() == "aaa\n"

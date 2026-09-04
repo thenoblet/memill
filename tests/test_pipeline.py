@@ -1,24 +1,28 @@
 from __future__ import annotations
 
+import os
 import threading
 import time
 from pathlib import Path
 from typing import Any
 
 import pytest
+from yt_dlp.utils import DownloadCancelled
 
 from yt2mp3 import pipeline
 from yt2mp3.config import Settings, VbrQuality
 from yt2mp3.encoder import LOUDNORM
-from yt2mp3.errors import DownloadError, TransferError
+from yt2mp3.errors import DownloadError, TransferError, Yt2Mp3Error
 from yt2mp3.naming import DEFAULT_MAX_STEM, MIN_STEM, stem_budget
 from yt2mp3.pipeline import (
     STATUS_DONE,
     STATUS_FAILED,
     STATUS_SKIPPED,
     BatchResult,
+    StemRegistry,
     TrackOutcome,
     run_batch,
+    staging_dir,
 )
 from yt2mp3.source import SourceMedia, TrackRef
 from yt2mp3.transfer import Archive
@@ -39,12 +43,14 @@ class FakeDownloader:
         *,
         fail: bool = False,
         fail_ids: tuple[str, ...] = (),
+        cancel_ids: tuple[str, ...] = (),
         info_extra: dict[str, Any] | None = None,
         cover: bool = False,
         delay: dict[str, float] | None = None,
     ) -> None:
         self.fail = fail
         self.fail_ids = set(fail_ids)
+        self.cancel_ids = set(cancel_ids)
         self.info_extra = dict(info_extra or {})
         self.cover = cover
         self.delay = dict(delay or {})
@@ -66,6 +72,10 @@ class FakeDownloader:
             self.max_concurrent = max(self.max_concurrent, self._live)
         try:
             time.sleep(self.delay.get(ref.video_id, 0.0))
+            if ref.video_id in self.cancel_ids:
+                # yt-dlp's own hierarchy, which source.py deliberately lets
+                # through unwrapped so it aborts the run rather than one track.
+                raise DownloadCancelled("user cancelled")
             if self.fail or ref.video_id in self.fail_ids:
                 raise DownloadError("network went away")
             audio = staging / f"{ref.video_id}.opus"
@@ -202,10 +212,14 @@ def test_an_archived_track_is_skipped_without_downloading(tmp_path: Path) -> Non
     assert result.outcomes[0].status == STATUS_SKIPPED
     assert downloader.calls == []
     assert result.exit_code == 0
-    # The skip must be decided before the track is announced as started, and no
-    # staging directory may be created for a track we never touch.
-    assert ("start", "aaa", "Some Mix") not in reporter.events
-    assert ("finish", "aaa", STATUS_SKIPPED) in reporter.events
+    # A skipped track must still be announced, or a reporter that keys its bar
+    # on track_started can never advance for it and a fully archived resume
+    # sits at 0/N for the whole run. Nothing may be downloaded or staged.
+    assert reporter.events == [
+        ("batch", "1"),
+        ("start", "aaa", "Some Mix"),
+        ("finish", "aaa", STATUS_SKIPPED),
+    ]
     assert not settings.staging_root.exists()
 
 
@@ -559,3 +573,162 @@ def test_batch_result_separates_completed_from_failed() -> None:
     assert result.exit_code == 1
     assert BatchResult((done, skipped)).exit_code == 0
     assert BatchResult().outcomes == ()
+
+
+def test_two_tracks_with_the_same_title_do_not_overwrite_each_other(
+    tmp_path: Path,
+) -> None:
+    """The silent-data-loss case: same stem, one file, both reported done."""
+    refs = [
+        TrackRef("aaa", "https://x/aaa", "Duplicate Title", 1.0),
+        TrackRef("bbb", "https://x/bbb", "Duplicate Title", 1.0),
+    ]
+    settings = make_settings(tmp_path, jobs=1)
+    archive = Archive(tmp_path / "a.txt")
+
+    class DistinctBytes(FakeDownloader):
+        def fetch(
+            self, ref: TrackRef, staging: Path, on_progress: Any = None
+        ) -> SourceMedia:
+            media = super().fetch(ref, staging, on_progress)
+            media.audio.write_bytes(ref.video_id.encode())
+            return media
+
+    def encode_the_source(
+        argv: list[str], *, duration: float | None, on_progress: Any = None
+    ) -> None:
+        # Carry the source bytes through, so a lost track is visible as lost
+        # bytes rather than as two identical files.
+        Path(argv[-1]).write_bytes(Path(argv[argv.index("-i") + 1]).read_bytes())
+        if on_progress:
+            on_progress(1.0)
+
+    result = run_batch(
+        refs,
+        settings=settings,
+        downloader=DistinctBytes(),
+        reporter=RecordingReporter(),
+        archive=archive,
+        encode=encode_the_source,
+    )
+    assert [outcome.status for outcome in result.outcomes] == [STATUS_DONE] * 2
+    assert (settings.destination / "Duplicate Title.mp3").read_bytes() == b"aaa"
+    assert (settings.destination / "Duplicate Title (2).mp3").read_bytes() == b"bbb"
+    assert sorted(path.name for path in settings.destination.iterdir()) == [
+        "Duplicate Title (2).mp3",
+        "Duplicate Title.mp3",
+    ]
+    assert "aaa" in archive
+    assert "bbb" in archive
+
+
+def test_stems_differing_only_in_case_are_treated_as_a_collision(
+    tmp_path: Path,
+) -> None:
+    # The destination is an NTFS mount, where "Track" and "TRACK" are one file.
+    refs = [
+        TrackRef("aaa", "https://x/aaa", "Track", 1.0),
+        TrackRef("bbb", "https://x/bbb", "TRACK", 1.0),
+    ]
+    settings = make_settings(tmp_path, jobs=1)
+    result = run_batch(
+        refs,
+        settings=settings,
+        downloader=FakeDownloader(),
+        reporter=RecordingReporter(),
+        archive=Archive(tmp_path / "a.txt"),
+        encode=fake_encode,
+    )
+    assert [outcome.status for outcome in result.outcomes] == [STATUS_DONE] * 2
+    assert sorted(path.name for path in settings.destination.iterdir()) == [
+        "TRACK (2).mp3",
+        "Track.mp3",
+    ]
+
+
+def test_the_stem_registry_hands_out_one_name_per_caller() -> None:
+    registry = StemRegistry()
+    assert registry.claim("Song") == "Song"
+    assert registry.claim("Song") == "Song (2)"
+    assert registry.claim("Song") == "Song (3)"
+    assert registry.claim("song") == "song (4)"  # case-folded
+    assert registry.claim("Other") == "Other"
+
+
+def test_a_run_level_abort_stops_the_queue(tmp_path: Path) -> None:
+    refs = [TrackRef("bad", "https://x/bad", "Bad", 1.0)] + [
+        TrackRef(f"id{i}", f"https://x/{i}", f"Track {i}", 1.0) for i in range(1, 8)
+    ]
+    settings = make_settings(tmp_path, jobs=1)
+    # The survivors are slow, so the cancel lands long before a second one
+    # could finish; with max_workers=1 at most one other can be in flight.
+    downloader = FakeDownloader(
+        cancel_ids=("bad",), delay={f"id{i}": 0.2 for i in range(1, 8)}
+    )
+    with pytest.raises(DownloadCancelled):
+        run_batch(
+            refs,
+            settings=settings,
+            downloader=downloader,
+            reporter=RecordingReporter(),
+            archive=Archive(tmp_path / "a.txt"),
+            encode=fake_encode,
+        )
+    started = {call.video_id for call in downloader.calls}
+    assert "bad" in started
+    assert len(started) <= 2  # the abort, plus at most one already in flight
+    assert not any(
+        (settings.destination / f"Track {i}.mp3").exists() for i in range(3, 8)
+    )
+
+
+def test_a_staging_key_that_could_escape_the_root_is_refused(tmp_path: Path) -> None:
+    precious = tmp_path / "precious"
+    precious.mkdir()
+    (precious / "keep.txt").write_text("do not delete")
+    root = tmp_path / "stage"
+    root.mkdir()
+
+    for key in ("../precious", "..", ".", "a/b", "a\\b", ""):
+        with pytest.raises(Yt2Mp3Error), staging_dir(root, key):
+            pass  # pragma: no cover - the body must never run
+
+    # rmtree is irreversible, so the guard has to hold before anything is made.
+    assert (precious / "keep.txt").read_text() == "do not delete"
+    assert list(root.iterdir()) == []
+
+
+def test_a_good_staging_key_still_works(tmp_path: Path) -> None:
+    root = tmp_path / "stage"
+    with staging_dir(root, "dQw4w9WgXcQ") as staging:
+        assert staging == root / "dQw4w9WgXcQ"
+        assert staging.is_dir()
+    assert not staging.exists()
+
+
+def test_an_unwritable_archive_fails_the_track_instead_of_the_run(
+    tmp_path: Path,
+) -> None:
+    if os.geteuid() == 0:
+        pytest.skip("root ignores directory permissions")
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    settings = make_settings(tmp_path)
+    archive = Archive(locked / "archive.txt")
+    locked.chmod(0o500)
+    try:
+        result = run_batch(
+            [REF],
+            settings=settings,
+            downloader=FakeDownloader(),
+            reporter=RecordingReporter(),
+            archive=archive,
+            encode=fake_encode,
+        )
+    finally:
+        locked.chmod(0o700)
+    # A bare PermissionError here would fly past the Yt2Mp3Error handler and
+    # abort a batch whose files had all been published.
+    assert result.outcomes[0].status == STATUS_FAILED
+    assert "archive" in (result.outcomes[0].error or "")
+    assert (settings.destination / "Some Mix.mp3").exists()
