@@ -1,0 +1,81 @@
+"""Runtime configuration.
+
+A leaf module: it imports nothing else from the package, so every other module
+is free to depend on it.
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from pathlib import Path
+
+DEFAULT_DESTINATION = Path("/mnt/e/Media/Music/New")
+DEFAULT_STAGING_ROOT = Path.home() / ".cache" / "yt2mp3"
+
+# Total concurrent HTTP connections. Four tracks times eight fragments is
+# thirty-two sockets, which is how you get throttled rather than how you go
+# fast, so jobs and fragments are derived from one another to hold this line.
+CONNECTION_BUDGET = 8
+
+_BITRATE = re.compile(r"^\d{1,4}k$")
+
+
+@dataclass(frozen=True, slots=True)
+class VbrQuality:
+    """LAME variable bitrate. ``level`` 0 is best, 9 is smallest."""
+
+    level: int
+
+    def __post_init__(self) -> None:
+        if not 0 <= self.level <= 9:
+            raise ValueError(f"VBR level must be 0..9, got {self.level}")
+
+    def ffmpeg_args(self) -> tuple[str, ...]:
+        return ("-q:a", str(self.level))
+
+
+@dataclass(frozen=True, slots=True)
+class CbrQuality:
+    """Constant bitrate, expressed the way ffmpeg wants it, e.g. ``320k``."""
+
+    bitrate: str
+
+    def __post_init__(self) -> None:
+        if not _BITRATE.match(self.bitrate):
+            raise ValueError(f"bitrate must look like '320k', got {self.bitrate!r}")
+
+    def ffmpeg_args(self) -> tuple[str, ...]:
+        return ("-b:a", self.bitrate)
+
+
+Quality = VbrQuality | CbrQuality
+
+
+def plan_concurrency(
+    jobs: int | None, *, cpu_count: int, budget: int = CONNECTION_BUDGET
+) -> tuple[int, int]:
+    """Return ``(jobs, fragments_per_job)`` holding total sockets near ``budget``."""
+    if jobs is not None and jobs < 1:
+        raise ValueError("jobs must be at least 1")
+    resolved = jobs if jobs is not None else min(4, max(1, cpu_count))
+    fragments = max(2, budget // resolved)
+    return resolved, fragments
+
+
+@dataclass(frozen=True, slots=True)
+class Settings:
+    """Everything the pipeline needs, fixed for the duration of one run."""
+
+    destination: Path
+    staging_root: Path
+    quality: Quality
+    jobs: int
+    fragments: int
+    normalize: bool = False
+    embed_cover: bool = True
+    clean_titles: bool = True
+    keep_source: bool = False
+    use_archive: bool = True
+    cookies_from_browser: str | None = None
+    dry_run: bool = False
