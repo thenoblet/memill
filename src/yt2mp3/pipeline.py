@@ -67,13 +67,24 @@ class StemRegistry:
         self._lock = threading.Lock()
         self._claimed: set[str] = set()
 
-    def claim(self, stem: str) -> str:
-        # Case-folded: the destination is an NTFS mount, where two stems
-        # differing only in case are the same file.
+    def claim(self, stem: str, *, max_length: int) -> str:
+        """Return a stem no other track in this batch holds, within
+        ``max_length``.
+
+        The marker is not simply appended: the base is re-truncated to make
+        room for it, because the caller's budget already accounts for the
+        destination path and the ``.part`` suffix, and overshooting it is
+        exactly the failure the budget exists to prevent.
+
+        Case-folded: the destination is an NTFS mount, where two stems
+        differing only in case are the same file.
+        """
         with self._lock:
             candidate, suffix = stem, 2
             while candidate.casefold() in self._claimed:
-                candidate = f"{stem} ({suffix})"
+                marker = f" ({suffix})"
+                head = stem[: max(1, max_length - len(marker))].rstrip(". ")
+                candidate = f"{head}{marker}"
                 suffix += 1
             self._claimed.add(candidate.casefold())
             return candidate
@@ -170,8 +181,9 @@ def process_track(
             media = downloader.fetch(ref, staging, report)
 
             tags = infer_tags(media.info, clean=settings.clean_titles)
+            budget = stem_budget(settings.destination)
             stem = registry.claim(
-                output_stem(tags, max_length=stem_budget(settings.destination))
+                output_stem(tags, max_length=budget), max_length=budget
             )
             encoded = staging / f"{stem}.mp3"
 

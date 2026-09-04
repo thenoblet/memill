@@ -13,7 +13,12 @@ from yt2mp3 import pipeline
 from yt2mp3.config import Settings, VbrQuality
 from yt2mp3.encoder import LOUDNORM
 from yt2mp3.errors import DownloadError, TransferError, Yt2Mp3Error
-from yt2mp3.naming import DEFAULT_MAX_STEM, MIN_STEM, stem_budget
+from yt2mp3.naming import (
+    DEFAULT_MAX_STEM,
+    MIN_STEM,
+    WINDOWS_PATH_LIMIT,
+    stem_budget,
+)
 from yt2mp3.pipeline import (
     STATUS_DONE,
     STATUS_FAILED,
@@ -648,11 +653,24 @@ def test_stems_differing_only_in_case_are_treated_as_a_collision(
 
 def test_the_stem_registry_hands_out_one_name_per_caller() -> None:
     registry = StemRegistry()
-    assert registry.claim("Song") == "Song"
-    assert registry.claim("Song") == "Song (2)"
-    assert registry.claim("Song") == "Song (3)"
-    assert registry.claim("song") == "song (4)"  # case-folded
-    assert registry.claim("Other") == "Other"
+    assert registry.claim("Song", max_length=150) == "Song"
+    assert registry.claim("Song", max_length=150) == "Song (2)"
+    assert registry.claim("Song", max_length=150) == "Song (3)"
+    assert registry.claim("song", max_length=150) == "song (4)"  # case-folded
+    assert registry.claim("Other", max_length=150) == "Other"
+
+
+def test_the_stem_registry_makes_room_for_the_marker() -> None:
+    """The marker replaces the tail; it never extends past the budget."""
+    registry = StemRegistry()
+    assert registry.claim("A" * 20, max_length=20) == "A" * 20
+    assert registry.claim("A" * 20, max_length=20) == f"{'A' * 16} (2)"
+    assert registry.claim("A" * 20, max_length=20) == f"{'A' * 16} (3)"
+    # A wider marker eats more of the base, not more of the budget.
+    registry = StemRegistry()
+    for _ in range(10):
+        assert len(registry.claim("B" * 30, max_length=30)) == 30
+    assert registry.claim("B" * 30, max_length=30) == f"{'B' * 25} (11)"
 
 
 def test_a_run_level_abort_stops_the_queue(tmp_path: Path) -> None:
@@ -732,3 +750,49 @@ def test_an_unwritable_archive_fails_the_track_instead_of_the_run(
     assert result.outcomes[0].status == STATUS_FAILED
     assert "archive" in (result.outcomes[0].error or "")
     assert (settings.destination / "Some Mix.mp3").exists()
+
+
+def test_a_long_duplicate_title_still_fits_the_destination_path(
+    tmp_path: Path,
+) -> None:
+    """The marker must be budgeted, not appended after the budget is spent."""
+    # Size the destination so stem_budget lands just above MIN_STEM: that is the
+    # regime where four appended characters cross WINDOWS_PATH_LIMIT.
+    target_budget = 40
+    pad = WINDOWS_PATH_LIMIT - 11 - target_budget - len(str(tmp_path)) - 1
+    destination = tmp_path / ("d" * pad)
+    settings = make_settings(tmp_path, destination=destination, jobs=1)
+    budget = stem_budget(destination)
+    assert budget == target_budget  # the premise: near the boundary, not far
+
+    title = "L" * 200
+    refs = [
+        TrackRef("aaa", "https://x/aaa", title, 1.0),
+        TrackRef("bbb", "https://x/bbb", title, 1.0),
+    ]
+    result = run_batch(
+        refs,
+        settings=settings,
+        downloader=FakeDownloader(),
+        reporter=RecordingReporter(),
+        archive=Archive(tmp_path / "a.txt"),
+        encode=fake_encode,
+    )
+    assert [outcome.status for outcome in result.outcomes] == [STATUS_DONE] * 2
+
+    names = sorted(path.name for path in destination.iterdir())
+    assert len(names) == 2
+    for name in names:
+        stem = name[: -len(".mp3")]
+        # publish writes "<stem>.mp3.part" before revealing the final name, so
+        # that is the longest path this file ever occupies.
+        assert (
+            len(str(destination)) + 1 + len(stem) + len(".mp3.part")
+            < WINDOWS_PATH_LIMIT
+        )
+        assert len(stem) <= budget
+    # Exactly one carries the marker, and it was truncated to make room for it
+    # rather than grown past the budget.
+    marked = [name for name in names if name.endswith(" (2).mp3")]
+    assert len(marked) == 1
+    assert len(marked[0]) == budget + len(".mp3")
