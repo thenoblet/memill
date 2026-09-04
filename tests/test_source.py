@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import io
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stderr
 from pathlib import Path
 from typing import Any
 
 import pytest
+from yt_dlp import YoutubeDL
 from yt_dlp.cookies import CookieLoadError
 from yt_dlp.utils import DownloadCancelled, ExtractorError, YoutubeDLError
 from yt_dlp.utils import DownloadError as YtDlpDownloadError
@@ -226,6 +228,11 @@ class SpyFactory:
         return session
 
 
+def without_logger(opts: dict[str, Any]) -> dict[str, Any]:
+    """The options minus the recorder, which is a fresh object every time."""
+    return {key: value for key, value in opts.items() if key != "logger"}
+
+
 def staged_audio(tmp_path: Path) -> tuple[Path, dict[str, Any]]:
     """A staging directory holding one downloaded file, plus yt-dlp's report."""
     staging = tmp_path / "stage" / "aaa"
@@ -275,8 +282,12 @@ def test_expand_extracts_flat_and_downloads_nothing(tmp_path: Path) -> None:
     # and not a copy of the previous session's, which yt-dlp has by then
     # written its own defaults into.
     assert spy.sessions[0].opts is not spy.sessions[1].opts
-    assert spy.sessions[1].received == first
+    assert without_logger(spy.sessions[1].received) == without_logger(first)
     assert not set(spy.sessions[1].received) & set(YT_DLP_INJECTED_KEYS)
+    # The recorder is the one option that must NOT be shared between the two:
+    # it holds the last complaint yt-dlp made, and the second URL's failure
+    # must not be reported against the first.
+    assert first["logger"] is not spy.sessions[1].received["logger"]
 
 
 def test_expand_prefers_the_canonical_url_and_synthesizes_a_missing_one(
@@ -545,3 +556,172 @@ def test_a_run_level_abort_is_not_demoted_to_a_per_track_failure(
         with pytest.raises(type(boom)) as fetched:
             downloader.fetch(TrackRef("aaa", "https://x/aaa", "One", None), tmp_path)
         assert fetched.value is boom
+
+
+# The exact shape of yt-dlp's last retry failure: FileDownloader.report_retry
+# calls report_error("\r[download] Got error: ..."), and report_error prefixes
+# "ERROR:" before handing it to trouble.
+RETRY_TEXT = "\r[download] Got error: simulated failure. Giving up after 5 retries"
+RETRY_FAILURE = f"ERROR: {RETRY_TEXT}"
+
+
+def download_opts(tmp_path: Path) -> dict[str, Any]:
+    """The options ``fetch`` really sends, captured from a completed fetch."""
+    captured: list[dict[str, Any]] = []
+    staging, info = staged_audio(tmp_path)
+    Downloader(make_settings(tmp_path), ydl_factory=fake_factory(info, captured)).fetch(
+        TrackRef("aaa", "https://x/aaa", "One", None), staging
+    )
+    return captured[-1]
+
+
+def test_yt_dlps_final_error_is_intercepted_instead_of_reaching_stderr(
+    tmp_path: Path,
+) -> None:
+    """``report_error`` consults neither ``quiet`` nor ``no_warnings``.
+
+    So yt-dlp's last retry failure is written to the real stderr regardless,
+    and the downloader prefixes that text with a carriage return: it lands at
+    column 0 and paints over the line the Rich display had just drawn there.
+    Passing a logger in the options is what diverts it.
+
+    Driven through a real ``YoutubeDL``, built from the options ``fetch``
+    actually sends and given no URL, because the claim is about yt-dlp's
+    behaviour rather than ours -- and a fake would only ever confirm itself.
+    """
+    opts = download_opts(tmp_path)
+
+    # The control first: without a logger the text really does escape, so the
+    # silence below is evidence and not an empty stream by luck.
+    escaped = io.StringIO()
+    with (
+        redirect_stderr(escaped),
+        YoutubeDL(without_logger(opts)) as ydl,
+        pytest.raises(YtDlpDownloadError),
+    ):
+        ydl.report_error(RETRY_TEXT)
+    assert RETRY_TEXT in escaped.getvalue()
+
+    quiet = io.StringIO()
+    with (
+        redirect_stderr(quiet),
+        YoutubeDL(dict(opts)) as ydl,
+        pytest.raises(YtDlpDownloadError),
+    ):
+        ydl.report_error(RETRY_TEXT)
+    assert quiet.getvalue() == ""
+    # It was not merely swallowed: the recorder has the reason to hand back.
+    assert "simulated failure" in opts["logger"].message
+
+
+def test_the_recorder_keeps_the_complaints_and_drops_the_chatter(
+    tmp_path: Path,
+) -> None:
+    """``to_screen`` routes every progress line to ``debug``; only the
+    complaints are worth retaining, and only the most recent one."""
+    recorder = download_opts(tmp_path)["logger"]
+
+    recorder.debug("[download]  51.0% of  412.00MiB at 1.20MiB/s")
+    recorder.info("[info] Downloading 1 format(s)")
+    assert recorder.message == ""
+
+    recorder.warning("nsig extraction failed")
+    assert recorder.message == "nsig extraction failed"
+    recorder.error("ERROR: unable to download video data")
+    assert recorder.message == "ERROR: unable to download video data"
+
+
+def logging_then_exploding_factory(logged: str, error: BaseException):
+    """A ydl_factory whose session complains through the logger, then raises.
+
+    That is yt-dlp's own order: ``trouble`` writes the message out -- into our
+    recorder, once one is installed -- and only afterwards raises.
+    """
+
+    class LoggingSession:
+        def __init__(self, opts: dict[str, Any]) -> None:
+            self._opts = opts
+
+        def __enter__(self) -> LoggingSession:
+            return self
+
+        def __exit__(self, *exc: object) -> bool:
+            return False
+
+        def extract_info(self, url: str, download: bool = False) -> Any:
+            self._opts["logger"].error(logged)
+            raise error
+
+    return LoggingSession
+
+
+def test_a_bare_yt_dlp_error_is_explained_by_what_it_logged(tmp_path: Path) -> None:
+    """The exception says nothing, so the recorder has to say it instead.
+
+    Otherwise the user is told "could not download <url>:" and left there,
+    with the actual reason having gone to a stderr they cannot read back.
+    """
+    downloader = Downloader(
+        make_settings(tmp_path),
+        ydl_factory=logging_then_exploding_factory(
+            RETRY_FAILURE, YtDlpDownloadError("")
+        ),
+    )
+
+    with pytest.raises(DownloadError) as excinfo:
+        downloader.fetch(TrackRef("aaa", "https://x/aaa", "One", None), tmp_path)
+
+    assert str(excinfo.value) == (
+        "could not download https://x/aaa: [download] Got error: "
+        "simulated failure. Giving up after 5 retries"
+    )
+
+
+def test_a_bare_error_from_expand_is_explained_the_same_way(tmp_path: Path) -> None:
+    downloader = Downloader(
+        make_settings(tmp_path),
+        ydl_factory=logging_then_exploding_factory(
+            "ERROR: Video unavailable", YtDlpDownloadError("")
+        ),
+    )
+
+    with pytest.raises(DownloadError) as excinfo:
+        downloader.expand(["https://x/p"])
+
+    assert str(excinfo.value) == "could not resolve https://x/p: Video unavailable"
+
+
+def test_our_message_never_carries_yt_dlps_carriage_return(tmp_path: Path) -> None:
+    """The reason usually IS in the exception -- with both prefixes attached.
+
+    Carried through verbatim, our own sentence sends the cursor back to column
+    0 and the reason overprints the explanation, which is how the user came to
+    see a line ending in a bare "ERROR:". The colourless and the tty-coloured
+    prefixes both have to go; ``_format_err`` decides which one at runtime.
+    """
+    for prefix in ("ERROR:", "\x1b[0;31mERROR:\x1b[0m"):
+        downloader = Downloader(
+            make_settings(tmp_path),
+            ydl_factory=exploding_factory(YtDlpDownloadError(f"{prefix} {RETRY_TEXT}")),
+        )
+
+        with pytest.raises(DownloadError) as excinfo:
+            downloader.fetch(TrackRef("aaa", "https://x/aaa", "One", None), tmp_path)
+
+        assert str(excinfo.value) == (
+            "could not download https://x/aaa: [download] Got error: "
+            "simulated failure. Giving up after 5 retries"
+        )
+        assert "\r" not in str(excinfo.value)
+
+
+def test_an_error_that_says_nothing_at_all_is_still_named(tmp_path: Path) -> None:
+    """Nothing in the exception and nothing logged: not a dangling colon."""
+    downloader = Downloader(
+        make_settings(tmp_path), ydl_factory=exploding_factory(YoutubeDLError(""))
+    )
+
+    with pytest.raises(DownloadError) as excinfo:
+        downloader.fetch(TrackRef("aaa", "https://x/aaa", "One", None), tmp_path)
+
+    assert str(excinfo.value) == "could not download https://x/aaa: YoutubeDLError"

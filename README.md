@@ -44,6 +44,14 @@ direction beyond doubt but gives multipliers too unstable to quote, so none is
 quoted here. Staging locally means a track crosses the mount once, at its final
 size, instead of thousands of times while it downloads.
 
+A track's staging directory is keyed on its video id, and is removed only once
+that track finishes. A failed or interrupted one is left where it is, so the
+next run resumes from the partial file yt-dlp wrote there instead of starting
+the download again — a network blip at 81% of a three-hour mix should not cost
+81% of a three-hour mix. The price is roughly one track's worth of disk per
+unfinished track, reclaimed by the next successful run of the same track, or by
+deleting `~/.cache/yt2mp3`.
+
 Filenames are sanitised for NTFS rather than only for ext4, so a title that
 Linux would happily accept cannot fail on arrival at the Windows mount, long
 after the expensive download has already happened.

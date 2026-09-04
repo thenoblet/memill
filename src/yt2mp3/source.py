@@ -6,6 +6,7 @@ network call. Nothing else in the package imports yt_dlp.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
@@ -23,6 +24,74 @@ YdlFactory = Callable[[dict[str, Any]], AbstractContextManager[Any]]
 
 _COVER_SUFFIXES = (".jpg", ".jpeg", ".webp", ".png")
 _HTTP_CHUNK_SIZE = 10 << 20  # 10 MiB; blunts YouTube's per-connection throttling.
+
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+_ERROR_PREFIX = "ERROR:"
+
+
+class _Recorder:
+    """Diverts yt-dlp's console output here, keeping its latest complaint.
+
+    ``quiet`` is not enough. yt-dlp's ``report_error`` goes through
+    ``to_stderr``, which never consults that flag, so the last retry's failure
+    is written to the real stderr straight across the Rich live display -- and
+    the downloader prefixes that text with a carriage return, so it lands at
+    column 0 and overwrites the line we had already drawn there. Passing a
+    logger in the options intercepts every one of those calls instead.
+
+    One instance per ``YoutubeDL``, never one per ``Downloader``: a single
+    Downloader is shared by the whole thread pool, so a recorder living on it
+    would let one track's failure explain another's. Within a single download
+    yt-dlp's fragment threads can report concurrently, which needs no lock
+    here -- the attribute store is atomic and last-writer-wins is the whole
+    contract.
+    """
+
+    __slots__ = ("message",)
+
+    def __init__(self) -> None:
+        self.message: str = ""
+
+    def debug(self, message: str) -> None:
+        """Dropped: ``to_screen`` lands here, progress chatter included."""
+
+    def info(self, message: str) -> None:
+        """Dropped: unused by yt-dlp today, but part of the interface."""
+
+    def warning(self, message: str) -> None:
+        self.message = message
+
+    def error(self, message: str) -> None:
+        self.message = message
+
+
+def _plain(message: str) -> str:
+    """yt-dlp's console text, made fit to sit inside a message of ours.
+
+    Two prefixes have to go. ``report_error`` adds "ERROR:", coloured when
+    stderr is a tty, and the retry path adds a carriage return; carried
+    verbatim into our own sentence the latter sends the cursor back to column
+    0 and overwrites the explanation with the reason. That is precisely what
+    the user saw -- a line ending in a bare "ERROR:", the rest of it printed
+    over its own beginning. Every other run of whitespace is collapsed too, so
+    what we raise is always one line.
+    """
+    text = _ANSI.sub("", message).strip()
+    if text.startswith(_ERROR_PREFIX):
+        text = text[len(_ERROR_PREFIX) :]
+    return " ".join(text.split())
+
+
+def _reason(exc: YoutubeDLError, recorder: _Recorder) -> str:
+    """Why the fetch failed, preferring the exception's own words.
+
+    The recorder is the fallback rather than the first choice because it holds
+    only the most recent line: accurate when the exception says nothing, but
+    the exception is the one that belongs to this failure. Some yt-dlp paths
+    raise with an empty message, or with nothing but the stripped "ERROR:",
+    and it is those that would otherwise reach the user explaining nothing.
+    """
+    return _plain(str(exc)) or _plain(recorder.message) or type(exc).__name__
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,9 +183,11 @@ class Downloader:
             # video escapes past the pipeline's Yt2Mp3Error handler and kills
             # the whole batch instead of failing one track. The dict is copied
             # per iteration because YoutubeDL writes its defaults into the
-            # options it is handed.
+            # options it is handed -- and each copy gets its own recorder, so
+            # one URL's complaint can never be reported against the next.
+            recorder = _Recorder()
             try:
-                with self._factory(dict(opts)) as ydl:
+                with self._factory({**opts, "logger": recorder}) as ydl:
                     info = ydl.extract_info(url, download=False)
             except (CookieLoadError, DownloadCancelled):
                 # Run-level aborts, not per-video failures: yt-dlp re-raises
@@ -124,7 +195,9 @@ class Downloader:
                 # resolution once, not repeat itself for every URL given.
                 raise
             except YoutubeDLError as exc:
-                raise DownloadError(f"could not resolve {url}: {exc}") from exc
+                raise DownloadError(
+                    f"could not resolve {url}: {_reason(exc, recorder)}"
+                ) from exc
             entries = info.get("entries") if isinstance(info, Mapping) else None
             candidates = entries if isinstance(entries, list) else [info]
             refs.extend(
@@ -136,7 +209,10 @@ class Downloader:
         return refs
 
     def _download_opts(
-        self, staging: Path, on_progress: Callable[[float], None] | None
+        self,
+        staging: Path,
+        on_progress: Callable[[float], None] | None,
+        recorder: _Recorder,
     ) -> dict[str, Any]:
         opts: dict[str, Any] = {
             "format": "bestaudio/best",
@@ -151,6 +227,12 @@ class Downloader:
             "quiet": True,
             "no_warnings": True,
             "noprogress": True,
+            # Those three are not enough on their own: report_error consults
+            # none of them. The logger is what actually keeps yt-dlp's last
+            # retry failure off our stderr, and it hands us the reason it
+            # would otherwise have printed there. Fresh per call, because the
+            # options dict is too.
+            "logger": recorder,
             # ffmpeg is ours; yt-dlp must not post-process behind our back.
             "postprocessors": [],
         }
@@ -167,8 +249,12 @@ class Downloader:
         on_progress: Callable[[float], None] | None = None,
     ) -> SourceMedia:
         """Download one track's audio (and thumbnail) into ``staging``."""
+        # Per call, not per Downloader: one Downloader serves the whole pool.
+        recorder = _Recorder()
         try:
-            with self._factory(self._download_opts(staging, on_progress)) as ydl:
+            with self._factory(
+                self._download_opts(staging, on_progress, recorder)
+            ) as ydl:
                 info = ydl.extract_info(ref.url, download=True)
         except (CookieLoadError, DownloadCancelled):
             # The same run-level aborts, on the path that runs once per track:
@@ -176,7 +262,9 @@ class Downloader:
             # identical per-track failures.
             raise
         except YoutubeDLError as exc:
-            raise DownloadError(f"could not download {ref.url}: {exc}") from exc
+            raise DownloadError(
+                f"could not download {ref.url}: {_reason(exc, recorder)}"
+            ) from exc
         if not isinstance(info, Mapping):
             raise DownloadError(f"yt-dlp returned no metadata for {ref.url}")
         return SourceMedia(

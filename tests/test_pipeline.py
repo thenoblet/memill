@@ -65,6 +65,9 @@ class FakeDownloader:
         self.calls: list[TrackRef] = []
         self.staging_seen: dict[str, Path] = {}
         self.staging_was_dir: list[bool] = []
+        # What was already in the directory on arrival -- the only way to see
+        # that a retry really is handed the partial file it should resume.
+        self.staging_contents: list[list[str]] = []
         self.max_concurrent = 0
         self._live = 0
         self._lock = threading.Lock()
@@ -76,6 +79,11 @@ class FakeDownloader:
             self.calls.append(ref)
             self.staging_seen[ref.video_id] = staging
             self.staging_was_dir.append(staging.is_dir())
+            self.staging_contents.append(
+                sorted(path.name for path in staging.iterdir())
+                if staging.is_dir()
+                else []
+            )
             self._live += 1
             self.max_concurrent = max(self.max_concurrent, self._live)
         try:
@@ -282,21 +290,55 @@ def test_one_failure_does_not_prevent_the_others_from_succeeding(
     assert result.exit_code == 1
 
 
-def test_staging_is_removed_even_when_the_track_fails(tmp_path: Path) -> None:
+def test_a_failed_track_keeps_its_staging_directory_for_the_retry(
+    tmp_path: Path,
+) -> None:
+    """The whole point of the directory surviving: the next run resumes.
+
+    yt-dlp writes a ``.part`` file into staging and continues from it, and
+    ``staging_dir`` is keyed on the video id, so the retry is handed the very
+    directory the failed attempt left behind. Removing it on failure -- what a
+    ``finally`` does -- is what turned a network blip at 81% of a three-hour
+    mix into a download starting again at 0%.
+
+    Real resumption needs yt-dlp and a network, so what is pinned here is the
+    retention contract underneath it: kept on failure, the same path for the
+    same id, the partial file still there when the retry arrives, and gone
+    once the retry succeeds.
+    """
     settings = make_settings(tmp_path)
-    downloader = FakeDownloader(fail=True)
+    staging = settings.staging_root / "aaa"
+    failed = FakeDownloader(fail=True)
     run_batch(
         [REF],
         settings=settings,
-        downloader=downloader,
+        downloader=failed,
         reporter=RecordingReporter(),
         archive=Archive(tmp_path / "a.txt"),
         encode=fake_encode,
     )
-    # The directory has to have existed for its removal to mean anything.
-    assert downloader.staging_was_dir == [True]
-    assert downloader.staging_seen["aaa"] == settings.staging_root / "aaa"
-    assert not (settings.staging_root / "aaa").exists()
+    # The directory has to have existed for its retention to mean anything.
+    assert failed.staging_was_dir == [True]
+    assert failed.staging_seen["aaa"] == staging
+    assert staging.is_dir()
+
+    (staging / "aaa.opus.part").write_bytes(b"the first 81 per cent")
+
+    retried = FakeDownloader()
+    run_batch(
+        [REF],
+        settings=settings,
+        downloader=retried,
+        reporter=RecordingReporter(),
+        archive=Archive(tmp_path / "a.txt"),
+        encode=fake_encode,
+    )
+    # Same directory, and the partial download still in it when yt-dlp -- for
+    # which this fake stands in -- was handed it.
+    assert retried.staging_seen["aaa"] == staging
+    assert retried.staging_contents == [["aaa.opus.part"]]
+    # Reclaimed by the run that succeeded, so the kept directory is not a leak.
+    assert not staging.exists()
 
 
 def test_staging_is_removed_after_a_successful_track(tmp_path: Path) -> None:
@@ -419,7 +461,9 @@ def test_a_failed_publish_leaves_the_track_out_of_the_archive(
     assert result.outcomes[0].status == STATUS_FAILED
     assert "read-only filesystem" in (result.outcomes[0].error or "")
     assert "aaa" not in archive
-    assert not (settings.staging_root / "aaa").exists()
+    # Kept, like every other failure: the downloaded audio is still in there
+    # and a retry should not have to fetch it again.
+    assert (settings.staging_root / "aaa").is_dir()
 
 
 def test_an_empty_batch_is_announced_and_returns_no_outcomes(tmp_path: Path) -> None:
@@ -487,7 +531,8 @@ def test_a_destination_too_long_for_a_filename_fails_only_that_track(
     # caught here rather than escaping and killing the batch.
     assert result.outcomes[0].status == STATUS_FAILED
     assert "too long" in (result.outcomes[0].error or "")
-    assert not (settings.staging_root / "aaa").exists()
+    # A failure inside the staging block keeps the directory, here as anywhere.
+    assert (settings.staging_root / "aaa").is_dir()
 
 
 def test_clean_titles_can_be_switched_off(tmp_path: Path) -> None:
@@ -735,6 +780,35 @@ def test_a_good_staging_key_still_works(tmp_path: Path) -> None:
     assert not staging.exists()
 
 
+def test_staging_survives_an_interrupt_so_the_next_run_can_resume(
+    tmp_path: Path,
+) -> None:
+    """Ctrl-C is the case that most wants a resumable ``.part`` file.
+
+    ``KeyboardInterrupt`` is not an ``Exception``, so a handler narrower than
+    ``BaseException`` would let the directory be swept away by exactly the
+    interruption the user expects to pick up from.
+    """
+    root = tmp_path / "stage"
+    with pytest.raises(KeyboardInterrupt), staging_dir(root, "aaa") as staging:
+        (staging / "aaa.opus.part").write_bytes(b"half a mix")
+        raise KeyboardInterrupt
+
+    assert (root / "aaa" / "aaa.opus.part").read_bytes() == b"half a mix"
+
+
+def test_staging_is_kept_when_the_body_raises_and_the_error_still_escapes(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "stage"
+    with pytest.raises(DownloadError, match="network went away"), staging_dir(
+        root, "aaa"
+    ):
+        raise DownloadError("network went away")
+
+    assert (root / "aaa").is_dir()
+
+
 def test_an_unwritable_archive_fails_the_track_instead_of_the_run(
     tmp_path: Path,
 ) -> None:
@@ -832,6 +906,16 @@ class GatedDownloader(FakeDownloader):
             # The brief's "one in-flight track taking ~5s": long enough that a
             # shutdown which waits for it is unmistakable against a 1s bound.
             self.released.wait(timeout=5.0)
+        else:
+            # Every other track waits for the gated one to be genuinely in
+            # flight before it aborts. Without this the two are only racing:
+            # a failure path quick enough to finish the batch before the other
+            # worker has even called fetch leaves nothing in flight for the
+            # shutdown to wait on, and the test measures nothing. Staging
+            # directories are no longer rmtree'd on the way out of a failure,
+            # which took exactly enough work out of that path to make the race
+            # lose about one run in seven.
+            self.entered.wait(timeout=5.0)
         return super().fetch(ref, staging, on_progress)
 
 

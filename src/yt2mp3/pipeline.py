@@ -120,7 +120,19 @@ _TRAVERSAL = frozenset({".", ".."})
 
 @contextmanager
 def staging_dir(root: Path, key: str) -> Iterator[Path]:
-    """A per-track scratch directory on ext4, removed however we leave it.
+    """A per-track scratch directory on ext4, removed on success only.
+
+    Kept on failure, deliberately. yt-dlp writes a ``.part`` file here and
+    resumes from it on the next attempt, and ``key`` is the video id, so the
+    directory a retry is handed is the same one the failed run left behind.
+    Removing it on the way out of a failure -- which a ``finally`` would --
+    throws away the only thing that makes the retry cheap: a network blip at
+    81% of a three-hour mix cost the whole 81%.
+
+    The trade: every failed or interrupted track leaves a directory behind,
+    roughly the size of one downloaded track each. Each is reclaimed by the
+    next successful run of the same id, and all of them by ``make clean``,
+    which wipes ``~/.cache/yt2mp3``.
 
     The key is refused rather than rewritten if it could name anything but a
     direct child of ``root``. This directory is handed to ``shutil.rmtree``,
@@ -142,7 +154,13 @@ def staging_dir(root: Path, key: str) -> Iterator[Path]:
         ) from exc
     try:
         yield path
-    finally:
+    except BaseException:
+        # BaseException, not Exception: Ctrl-C mid-download is the case that
+        # most wants a resumable .part file. Both clauses do the same thing
+        # here -- the removal lives in the else -- but naming it says the
+        # interrupted run was considered, not overlooked.
+        raise
+    else:
         shutil.rmtree(path, ignore_errors=True)
 
 
