@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import io
 
+import pytest
+
 from yt2mp3.reporting import (
     PHASE_DOWNLOAD,
     PHASE_ENCODE,
@@ -97,57 +99,90 @@ def test_rich_reporter_drives_all_methods_and_tracks_tasks() -> None:
         assert rich_reporter._overall is not None
         assert rich_reporter._total == 2
         assert rich_reporter._done == 0
-        assert len(rich_reporter._progress.tasks) == 1
-        batch_task = rich_reporter._progress.tasks[rich_reporter._overall]
+        assert len(rich_reporter._progress._tasks) == 1
+        batch_task = rich_reporter._progress._tasks[rich_reporter._overall]
         assert batch_task.total == 2
 
         # First track starts
         rich_reporter.track_started("t1", "Track One")
-        assert len(rich_reporter._progress.tasks) == 2
+        assert len(rich_reporter._progress._tasks) == 2
         assert rich_reporter._labels["t1"] == "Track One"
 
         # First track enters download phase
         rich_reporter.track_phase("t1", PHASE_DOWNLOAD)
-        t1_task = rich_reporter._progress.tasks[rich_reporter._tasks["t1"]]
+        t1_task = rich_reporter._progress._tasks[rich_reporter._tasks["t1"]]
         assert "↓" in t1_task.fields["label"]
         assert "Track One" in t1_task.fields["label"]
 
         # First track progresses
         rich_reporter.track_progress("t1", 0.5)
-        t1_task = rich_reporter._progress.tasks[rich_reporter._tasks["t1"]]
+        t1_task = rich_reporter._progress._tasks[rich_reporter._tasks["t1"]]
         assert t1_task.completed == 0.5
 
         # First track finishes
         rich_reporter.track_finished("t1", "done")
         assert "t1" not in rich_reporter._tasks
         assert rich_reporter._done == 1
-        batch_task = rich_reporter._progress.tasks[rich_reporter._overall]
+        batch_task = rich_reporter._progress._tasks[rich_reporter._overall]
         # Batch label should reflect progress
         assert "1/2" in batch_task.fields["label"]
 
-        # Second track starts and finishes
+        # Call-ordering wrinkle: start another track (reordering tasks)
+        # and verify the fragile _tasks dict lookup still works
         rich_reporter.track_started("t2", "Track Two")
-        assert len(rich_reporter._progress.tasks) == 2
+        assert len(rich_reporter._progress._tasks) == 2
+        t2_task = rich_reporter._progress._tasks[rich_reporter._tasks["t2"]]
+        assert "Track Two" in t2_task.fields["label"]
+
+        # Second track finishes
         rich_reporter.track_finished("t2", "done")
         assert rich_reporter._done == 2
-        batch_task = rich_reporter._progress.tasks[rich_reporter._overall]
+        batch_task = rich_reporter._progress._tasks[rich_reporter._overall]
         assert "2/2" in batch_task.fields["label"]
 
         # Unknown key must not advance batch counter or batch progress
-        batch_task = rich_reporter._progress.tasks[rich_reporter._overall]
+        batch_task = rich_reporter._progress._tasks[rich_reporter._overall]
         batch_completed_before = batch_task.completed
         initial_done = rich_reporter._done
         rich_reporter.track_finished("unknown", "error")
         assert rich_reporter._done == initial_done
-        batch_task = rich_reporter._progress.tasks[rich_reporter._overall]
+        batch_task = rich_reporter._progress._tasks[rich_reporter._overall]
         assert batch_task.completed == batch_completed_before
     finally:
         rich_reporter.close()
 
 
-def test_rich_reporter_context_manager() -> None:
-    """RichReporter must support context manager protocol."""
-    stream = io.StringIO()
-    with RichReporter.for_stream(stream) as reporter:
-        assert isinstance(reporter, RichReporter)
+def test_rich_reporter_context_manager_stops_the_display() -> None:
+    """RichReporter context manager must stop the live display on normal exit."""
+    class FakeTty(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    sink = FakeTty()
+    with RichReporter.for_stream(sink) as reporter:
         reporter.batch_started(1)
+        assert reporter._progress.live.is_started
+    assert not reporter._progress.live.is_started
+
+
+def test_rich_reporter_context_manager_stops_on_exception() -> None:
+    """RichReporter context manager must stop the live display even on exception."""
+    class FakeTty(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    sink = FakeTty()
+    reporter = RichReporter.for_stream(sink)
+    with pytest.raises(RuntimeError), reporter:
+        reporter.batch_started(1)
+        raise RuntimeError("boom")
+    assert not reporter._progress.live.is_started
+
+
+def test_plain_reporter_context_manager_flushes_and_returns_self() -> None:
+    """PlainReporter context manager must return self and flush on exit."""
+    stream = io.StringIO()
+    with PlainReporter(stream) as reporter:
+        assert isinstance(reporter, PlainReporter)
+        reporter.batch_started(1)
+    assert stream.getvalue()
