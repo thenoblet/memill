@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import concurrent.futures
 import shutil
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -107,18 +107,31 @@ def test_a_failing_encode_raises_with_ffmpeg_stderr(tmp_path: Path) -> None:
     assert "nope.wav" in str(excinfo.value)
 
 
-def test_large_stderr_does_not_deadlock(tmp_path: Path) -> None:
-    """The stderr-to-tempfile design exists for this. A second pipe would hang."""
+def test_large_stderr_does_not_deadlock() -> None:
+    """The stderr-to-tempfile design exists for this; a second pipe hangs.
+
+    Verified by mutation: changing ``stderr`` to ``subprocess.PIPE`` makes this
+    fail. A deadlocked thread can never be joined, so the worker must be a
+    daemon -- otherwise the failure hangs the session instead of reporting it.
+    """
     argv = [
         sys.executable,
         "-c",
         "import sys; sys.stderr.write('x' * 5_000_000); sys.exit(1)",
     ]
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(run_encode, argv, duration=None)
-        with pytest.raises(EncodeError):
-            # A deadlock shows up as TimeoutError rather than hanging the suite.
-            future.result(timeout=30)
+    captured: list[Exception | None] = [None]
+
+    def target() -> None:
+        try:
+            run_encode(argv, duration=None)
+        except Exception as exc:
+            captured[0] = exc
+
+    worker = threading.Thread(target=target, daemon=True)
+    worker.start()
+    worker.join(timeout=30)
+    assert not worker.is_alive(), "run_encode deadlocked on large stderr"
+    assert isinstance(captured[0], EncodeError)
 
 
 def test_require_ffmpeg_passes_when_both_present() -> None:
