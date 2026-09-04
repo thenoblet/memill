@@ -49,6 +49,7 @@ class FakeDownloader:
         fail: bool = False,
         fail_ids: tuple[str, ...] = (),
         cancel_ids: tuple[str, ...] = (),
+        cancel_error: type[BaseException] = DownloadCancelled,
         info_extra: dict[str, Any] | None = None,
         cover: bool = False,
         delay: dict[str, float] | None = None,
@@ -56,6 +57,7 @@ class FakeDownloader:
         self.fail = fail
         self.fail_ids = set(fail_ids)
         self.cancel_ids = set(cancel_ids)
+        self.cancel_error = cancel_error
         self.info_extra = dict(info_extra or {})
         self.cover = cover
         self.delay = dict(delay or {})
@@ -78,9 +80,12 @@ class FakeDownloader:
         try:
             time.sleep(self.delay.get(ref.video_id, 0.0))
             if ref.video_id in self.cancel_ids:
-                # yt-dlp's own hierarchy, which source.py deliberately lets
-                # through unwrapped so it aborts the run rather than one track.
-                raise DownloadCancelled("user cancelled")
+                # DownloadCancelled is yt-dlp's own, which source.py
+                # deliberately lets through unwrapped so it aborts the run
+                # rather than one track. KeyboardInterrupt is Ctrl-C, and is
+                # not an Exception -- the case the handler's BaseException
+                # clause exists for.
+                raise self.cancel_error("user cancelled")
             if self.fail or ref.video_id in self.fail_ids:
                 raise DownloadError("network went away")
             audio = staging / f"{ref.video_id}.opus"
@@ -673,7 +678,10 @@ def test_the_stem_registry_makes_room_for_the_marker() -> None:
     assert registry.claim("B" * 30, max_length=30) == f"{'B' * 25} (11)"
 
 
-def test_a_run_level_abort_stops_the_queue(tmp_path: Path) -> None:
+@pytest.mark.parametrize("abort", [DownloadCancelled, KeyboardInterrupt])
+def test_a_run_level_abort_stops_the_queue(
+    tmp_path: Path, abort: type[BaseException]
+) -> None:
     refs = [TrackRef("bad", "https://x/bad", "Bad", 1.0)] + [
         TrackRef(f"id{i}", f"https://x/{i}", f"Track {i}", 1.0) for i in range(1, 8)
     ]
@@ -681,9 +689,11 @@ def test_a_run_level_abort_stops_the_queue(tmp_path: Path) -> None:
     # The survivors are slow, so the cancel lands long before a second one
     # could finish; with max_workers=1 at most one other can be in flight.
     downloader = FakeDownloader(
-        cancel_ids=("bad",), delay={f"id{i}": 0.2 for i in range(1, 8)}
+        cancel_ids=("bad",),
+        cancel_error=abort,
+        delay={f"id{i}": 0.2 for i in range(1, 8)},
     )
-    with pytest.raises(DownloadCancelled):
+    with pytest.raises(abort):
         run_batch(
             refs,
             settings=settings,

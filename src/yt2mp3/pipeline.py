@@ -249,6 +249,10 @@ def run_batch(
         try:
             for future in as_completed(futures):
                 results[futures[future]] = future.result()
+        # BaseException, deliberately, not Exception: KeyboardInterrupt is
+        # the case that matters most here and is not an Exception, so the
+        # narrower clause would let Ctrl-C skip the cancellation below and
+        # surface only once the whole queue had drained.
         except BaseException:
             # Only a run-level abort gets here -- a cancelled download, an
             # unreadable cookie store, Ctrl-C -- because process_track
