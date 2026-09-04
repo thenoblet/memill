@@ -17,15 +17,17 @@ Requires Python 3.11+ and ffmpeg (with `libmp3lame` and `mjpeg`).
 ./setup.sh
 ```
 
-That builds a virtualenv in `.venv`, installs the package into it, and links
-`~/.local/bin/yt2mp3` at the launcher. It is safe to re-run; if something
-unrelated already occupies that path it says so and stops rather than replacing
-it.
+That builds a virtualenv in `.venv`, installs the package into it along with the
+`[dev]` extra (pytest, mypy, ruff — what the Development commands below need),
+and links `~/.local/bin/yt2mp3` at the launcher. It is safe to re-run; if
+something unrelated already occupies that path it says so and stops rather than
+replacing it.
 
 ## What it does
 
-1. yt-dlp fetches the **audio-only** stream — a music video is roughly 50 MB of
-   H.264 wrapped around 4 MB of audio, and this never downloads the video.
+1. yt-dlp fetches the **audio-only** stream. The video track of a music video
+   runs 1-3 Mbps against the audio's ~160 kbps, so it is most of what you would
+   otherwise pay for, and this never downloads it.
 2. One ffmpeg pass encodes to MP3, writes ID3v2.3 tags (plus a v1 trailer for
    older players) and embeds the thumbnail as square cover art, centre-cropped
    from 16:9. Not three chained passes rewriting the file each time.
@@ -33,12 +35,13 @@ it.
    by an atomic rename, so an interrupted run never leaves a truncated file
    wearing a finished name.
 
-Downloading and encoding happen on the Linux filesystem (`~/.cache/yt2mp3`), not
-on the mounted Windows drive. Measured on the development machine — ext4 against
-the same machine's 9p `/mnt/e` mount, best of three runs each — that mount takes
-0.55 s to write 64 MB against ext4's 0.03 s, and 2.8 s to write 400 fsynced
-64 KB files against ext4's 0.6 s: roughly 18x slower for a bulk write and 5x
-slower for the many small writes a fragmented download makes.
+Downloading and encoding happen on the Linux filesystem (`~/.cache/yt2mp3`), and
+only the finished file is written to the mounted Windows drive. The mount is a
+9p filesystem and is substantially slower than ext4 for both bulk writes and the
+many small writes a fragmented download makes — repeated benchmarking puts the
+direction beyond doubt but gives multipliers too unstable to quote, so none is
+quoted here. Staging locally means a track crosses the mount once, at its final
+size, instead of thousands of times while it downloads.
 
 Filenames are sanitised for NTFS rather than only for ext4, so a title that
 Linux would happily accept cannot fail on arrival at the Windows mount, long
@@ -87,5 +90,7 @@ for transcoded material; `-b 320k` is there if you want it anyway.
 
 `tests/test_end_to_end.py` is the only suite that shells out to ffmpeg. It
 synthesises its own tone and artwork with `lavfi` and skips itself when ffmpeg
-or ffprobe is absent. Nothing in the suite touches the network; a real download
-is the one thing left that does, and that is your call to run.
+or ffprobe is absent. It needs one encoder beyond what the tool itself uses: the
+native `mpeg4` encoder, to build a muxed audio+video fixture. Nothing in the
+suite touches the network; a real download is the one thing left that does, and
+that is your call to run.

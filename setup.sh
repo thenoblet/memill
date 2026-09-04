@@ -23,15 +23,23 @@ launcher="$PWD/.venv/bin/yt2mp3"
 link="$HOME/.local/bin/yt2mp3"
 mkdir -p "$HOME/.local/bin"
 
+# Both sides resolved the same way. bash's $PWD is the *logical* path, so if
+# this script is reached through a symlinked directory it does not spell the
+# launcher the way readlink does -- and comparing one against the other makes
+# the script refuse to overwrite the very link it created on the last run.
+launcher_real="$(readlink -f -- "$launcher")"
+
 if [[ -e "$link" || -L "$link" ]]; then
-    if [[ -L "$link" && "$(readlink -f -- "$link")" == "$launcher" ]]; then
+    if [[ -L "$link" && "$(readlink -f -- "$link")" == "$launcher_real" ]]; then
         echo "already linked -> $link"
     else
         echo "refusing to overwrite $link" >&2
         if [[ -L "$link" ]]; then
             echo "  it is a symlink to: $(readlink -- "$link")" >&2
+        elif [[ -d "$link" ]]; then
+            echo "  it is an existing directory" >&2
         else
-            echo "  it is an existing regular file" >&2
+            echo "  it is an existing file" >&2
         fi
         echo "  remove it yourself, or just run $launcher" >&2
         exit 1

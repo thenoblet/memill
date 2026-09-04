@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from yt2mp3.config import CbrQuality, VbrQuality
-from yt2mp3.encoder import ProgressParser, build_encode_command
+from yt2mp3.encoder import LOUDNORM, ProgressParser, build_encode_command
 from yt2mp3.naming import TrackTags
 
 AUDIO = Path("/stage/a.opus")
@@ -52,7 +52,20 @@ def test_quality_flags_come_from_the_quality_object() -> None:
 
 def test_normalize_adds_a_single_pass_loudnorm_filter() -> None:
     argv = _cmd(normalize=True)
-    assert argv[argv.index("-af") + 1].startswith("loudnorm=")
+    assert argv[argv.index("-af") + 1] == LOUDNORM
+
+
+def test_the_loudnorm_target_is_pinned_to_a_literal() -> None:
+    """The only assertion in the suite that a retarget has to get past.
+
+    Every other reference to this filter is written in terms of LOUDNORM
+    itself -- `startswith("loudnorm=")` here before, and `LOUDNORM in argv` in
+    test_pipeline -- so all of them move with the constant and none of them
+    would notice I=-14 becoming something else. The end-to-end suite measures
+    the resulting loudness, but it skips wherever ffmpeg is absent, so the
+    target needs pinning somewhere that always runs.
+    """
+    assert LOUDNORM == "loudnorm=I=-14:TP=-1.5:LRA=11"
 
 
 def test_tags_are_emitted_as_key_equals_value() -> None:

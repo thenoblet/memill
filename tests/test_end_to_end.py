@@ -134,15 +134,20 @@ def encoded(tmp_path_factory: pytest.TempPathFactory) -> Encoded:
         "-metadata", "composer=Nobody",
         str(audio),
     )  # fmt: skip
-    # 640x360, red margins around a blue 360x360 centre. Centre-cropping keeps
-    # only the blue; scaling alone would squash the red margins in. A plain
-    # "is it square?" assertion cannot tell those apart, because scale=600:600
-    # forces a square whether the crop ran or not -- so the colours are the
-    # evidence, and this fixture exists to make them differ.
+    # 640x360, red margins around a blue centre. Centre-cropping keeps only the
+    # blue; scaling alone would squash the red margins in. A plain "is it
+    # square?" assertion cannot tell those apart, because scale=600:600 forces
+    # a square whether the crop ran or not -- so the colours are the evidence,
+    # and this fixture exists to make them differ.
+    #
+    # The blue is 440 wide, not the 360 the crop takes. Sizing it to exactly
+    # the crop width would put the assertion on a zero-slack boundary, one
+    # pixel of rounding away from reading a red edge for the wrong reason;
+    # 440 leaves 40px of margin on each side of the 360-wide centred crop.
     _ffmpeg(
-        "-f", "lavfi", "-i", "color=c=red:s=140x360",
-        "-f", "lavfi", "-i", "color=c=blue:s=360x360",
-        "-f", "lavfi", "-i", "color=c=red:s=140x360",
+        "-f", "lavfi", "-i", "color=c=red:s=100x360",
+        "-f", "lavfi", "-i", "color=c=blue:s=440x360",
+        "-f", "lavfi", "-i", "color=c=red:s=100x360",
         "-filter_complex", "[0:v][1:v][2:v]hstack=inputs=3",
         "-frames:v", "1", str(cover),
     )  # fmt: skip
@@ -220,6 +225,11 @@ def test_progress_is_parsed_from_real_ffmpeg_and_reaches_completion(
     encoded: Encoded,
 ) -> None:
     assert encoded.progress, "ffmpeg emitted nothing run_encode could parse"
+    # More than one, because every other assertion here is satisfied by a bare
+    # [1.0] -- which is what an implementation that parsed only `progress=end`
+    # and ignored out_time_us entirely would produce. Intermediate samples are
+    # the whole point of streaming the pipe; three arrive for this encode.
+    assert len(encoded.progress) > 1, f"only terminal progress: {encoded.progress}"
     assert all(0.0 <= fraction <= 1.0 for fraction in encoded.progress)
     assert encoded.progress == sorted(encoded.progress)
     assert encoded.progress[-1] == 1.0
@@ -289,9 +299,11 @@ def test_normalize_moves_the_level_to_the_loudnorm_target(tmp_path: Path) -> Non
     assert float(_probe(normalized)["format"]["duration"]) > 2.0
 
     # loudnorm=I=-14 lands this tone at -13.3 dBFS on ffmpeg 4.4, repeatably.
-    # The band leaves room for version drift and is still clear of the -23.3
-    # and -4.5 that I=-24 and I=-5 measure at, so retargeting the filter is
-    # caught rather than absorbed.
-    assert -17.0 < _mean_volume(normalized) < -10.0
+    # The band is deliberately loose: it still excludes the -23.3 and -4.5 that
+    # I=-24 and I=-5 measure at, so a retarget cannot hide in it, while leaving
+    # ~6 dB of room for a future ffmpeg changing single-pass loudnorm slightly.
+    # The exact target is pinned as a literal in test_encoder.py, which does
+    # not need ffmpeg and therefore never skips.
+    assert -20.0 < _mean_volume(normalized) < -8.0
     # And it moved: an ignored --normalize would produce two identical files.
     assert _mean_volume(normalized) - _mean_volume(plain) > 3.0
