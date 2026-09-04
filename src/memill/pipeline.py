@@ -13,7 +13,7 @@ from typing import Any, Protocol
 
 from memill.config import Settings
 from memill.encoder import build_encode_command, run_encode
-from memill.errors import TransferError, Yt2Mp3Error
+from memill.errors import TransferError, Yt2Mp3Error, os_errors_as
 from memill.naming import (
     DEFAULT_MAX_STEM_BYTES,
     infer_tags,
@@ -162,16 +162,12 @@ def staging_dir(root: Path, key: str) -> Iterator[Path]:
     if not key or "/" in key or "\\" in key or key in _TRAVERSAL:
         raise Yt2Mp3Error(f"unsafe staging key: {key!r}")
     path = root / key
-    try:
+    # A read-only staging root, a full disk or a bad --cache path are expected
+    # failures, not bugs. A bare OSError here would fly past the pipeline's
+    # Yt2Mp3Error handler and abort the whole batch -- the same defect
+    # Archive.add already guards against, one module over.
+    with os_errors_as(TransferError, f"could not create the staging directory {path}"):
         path.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        # A read-only staging root, a full disk or a bad --cache path are
-        # expected failures, not bugs. A bare OSError here would fly past the
-        # pipeline's Yt2Mp3Error handler and abort the whole batch -- the same
-        # defect Archive.add already guards against, one module over.
-        raise TransferError(
-            f"could not create the staging directory {path}: {exc}"
-        ) from exc
     yield path
     # Reached on success only, and no try/except is needed to arrange that: a
     # generator-based context manager whose ``yield`` raised is never resumed,

@@ -7,7 +7,7 @@ import threading
 from contextlib import suppress
 from pathlib import Path
 
-from memill.errors import TransferError
+from memill.errors import TransferError, os_errors_as
 
 ARCHIVE_FILENAME = ".memill-archive"
 
@@ -21,25 +21,27 @@ def publish(source: Path, destination_dir: Path, filename: str) -> Path:
     looking finished -- so the bytes land under ``.part`` first and are revealed
     by a rename, which within one filesystem is atomic.
 
-    The ``mkdir`` is inside the ``try`` with the copy, not before it. An absent
-    destination mount or an unwritable ``-o`` directory raises there, and a
-    bare ``OSError`` escaping this call flies past the pipeline's
+    The ``mkdir`` is inside the wrapped block with the copy, not before it. An
+    absent destination mount or an unwritable ``-o`` directory raises there,
+    and a bare ``OSError`` escaping this call flies past the pipeline's
     ``Yt2Mp3Error`` handler and cancels every remaining track in the batch --
     the same defect ``Archive.add`` already guards against below.
     """
     final = destination_dir / filename
     partial = destination_dir / f"{filename}.part"
     try:
-        destination_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(source, partial)
-        partial.replace(final)
-    except OSError as exc:
-        # The cleanup can fail too -- a leftover .part in a directory that has
-        # since gone read-only -- and that second OSError must not replace the
-        # first one on its way out.
+        with os_errors_as(TransferError, f"could not publish {filename}"):
+            destination_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, partial)
+            partial.replace(final)
+    except TransferError:
+        # Caught after the conversion rather than instead of it, so this stays
+        # a cleanup and the wrapping stays in one place. The cleanup can fail
+        # too -- a leftover .part in a directory that has since gone read-only
+        # -- and that second OSError must not replace the first on its way out.
         with suppress(OSError):
             partial.unlink(missing_ok=True)
-        raise TransferError(f"could not publish {filename}: {exc}") from exc
+        raise
     return final
 
 
@@ -89,12 +91,10 @@ class Archive:
         with self._lock:
             if key in self._seen:
                 return
-            try:
+            with os_errors_as(
+                TransferError, f"could not record {key} in the archive {self._path}"
+            ):
                 self._path.parent.mkdir(parents=True, exist_ok=True)
                 with self._path.open("a", encoding="utf-8") as handle:
                     handle.write(f"{key}\n")
-            except OSError as exc:
-                raise TransferError(
-                    f"could not record {key} in the archive {self._path}: {exc}"
-                ) from exc
             self._seen.add(key)

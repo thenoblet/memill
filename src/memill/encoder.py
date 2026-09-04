@@ -9,7 +9,7 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 
 from memill.config import Quality
-from memill.errors import DependencyError, EncodeError
+from memill.errors import DependencyError, EncodeError, os_errors_as
 from memill.naming import TrackTags
 
 COVER_SIZE = 600
@@ -140,37 +140,37 @@ def run_encode(
     discard the incremental progress this function exists to deliver.
     """
     parser = ProgressParser(duration)
-    try:
-        with tempfile.TemporaryFile(
-            mode="w+", encoding="utf-8", errors="replace"
-        ) as stderr:
-            # argv is built by us from Path objects and never a shell string.
-            process = subprocess.Popen(
-                list(argv),
-                stdout=subprocess.PIPE,
-                stderr=stderr,
-                stdin=subprocess.DEVNULL,
-                text=True,
-                bufsize=1,
-            )
-            # Popen is itself a context manager: it closes the pipes and waits,
-            # so there is no hand-rolled cleanup to get wrong on the error path.
-            with process:
-                for line in process.stdout or ():
-                    fraction = parser.feed(line)
-                    if fraction is not None and on_progress is not None:
-                        on_progress(fraction)
+    # Starting the process is a failure mode of its own, distinct from the
+    # non-zero exit below: ffmpeg uninstalled between the startup check and
+    # this track, a fork refused with EAGAIN under a large -j, or a full /tmp
+    # that the scratch file cannot be created in. ``require_ffmpeg`` closes
+    # only the startup window. A bare OSError escaping here is outside
+    # errors.py's contract, so ``process_track`` would let it through and one
+    # track's mishap would cancel the whole batch. The EncodeError raised
+    # inside for a non-zero exit is already in the hierarchy and passes
+    # through this untouched, keeping ffmpeg's own words.
+    with (
+        os_errors_as(EncodeError, "could not run ffmpeg"),
+        tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") as stderr,
+    ):
+        # argv is built by us from Path objects and never a shell string.
+        process = subprocess.Popen(
+            list(argv),
+            stdout=subprocess.PIPE,
+            stderr=stderr,
+            stdin=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+        )
+        # Popen is itself a context manager: it closes the pipes and waits,
+        # so there is no hand-rolled cleanup to get wrong on the error path.
+        with process:
+            for line in process.stdout or ():
+                fraction = parser.feed(line)
+                if fraction is not None and on_progress is not None:
+                    on_progress(fraction)
 
-            if process.returncode != 0:
-                stderr.seek(0)
-                detail = stderr.read().strip()[-_STDERR_TAIL_CHARS:]
-                raise EncodeError(f"ffmpeg exited {process.returncode}: {detail}")
-    except OSError as exc:
-        # Starting the process is a failure mode of its own, distinct from the
-        # non-zero exit above: ffmpeg uninstalled between the startup check and
-        # this track, a fork refused with EAGAIN under a large -j, or a full
-        # /tmp that the scratch file cannot be created in. ``require_ffmpeg``
-        # closes only the startup window. A bare OSError escaping here is
-        # outside errors.py's contract, so ``process_track`` would let it
-        # through and one track's mishap would cancel the whole batch.
-        raise EncodeError(f"could not run ffmpeg: {exc}") from exc
+        if process.returncode != 0:
+            stderr.seek(0)
+            detail = stderr.read().strip()[-_STDERR_TAIL_CHARS:]
+            raise EncodeError(f"ffmpeg exited {process.returncode}: {detail}")
