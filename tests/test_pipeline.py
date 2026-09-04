@@ -15,6 +15,7 @@ from yt2mp3.encoder import LOUDNORM
 from yt2mp3.errors import DownloadError, TransferError, Yt2Mp3Error
 from yt2mp3.naming import (
     DEFAULT_MAX_STEM,
+    KEPT_SOURCE_EXTENSION,
     MIN_STEM,
     WINDOWS_PATH_LIMIT,
     stem_budget,
@@ -806,3 +807,191 @@ def test_a_long_duplicate_title_still_fits_the_destination_path(
     marked = [name for name in names if name.endswith(" (2).mp3")]
     assert len(marked) == 1
     assert len(marked[0]) == budget + len(".mp3")
+
+
+class GatedDownloader(FakeDownloader):
+    """``FakeDownloader`` whose named track blocks until the test releases it.
+
+    An event rather than a plain sleep, because the assertion is about how
+    long ``run_batch`` takes to raise *while a fetch is still running*. A
+    fixed sleep would either be too short to be evidence, or would leave a
+    worker thread writing into a ``tmp_path`` pytest is about to delete.
+    """
+
+    def __init__(self, gated_id: str, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._gated_id = gated_id
+        self.entered = threading.Event()
+        self.released = threading.Event()
+
+    def fetch(
+        self, ref: TrackRef, staging: Path, on_progress: Any = None
+    ) -> SourceMedia:
+        if ref.video_id == self._gated_id:
+            self.entered.set()
+            # The brief's "one in-flight track taking ~5s": long enough that a
+            # shutdown which waits for it is unmistakable against a 1s bound.
+            self.released.wait(timeout=5.0)
+        return super().fetch(ref, staging, on_progress)
+
+
+def test_an_abort_does_not_wait_for_the_track_already_running(
+    tmp_path: Path,
+) -> None:
+    """Ctrl-C must surface at once, not once the in-flight fetch has finished.
+
+    ``with ThreadPoolExecutor(...)`` calls ``shutdown(wait=True)`` on the way
+    out, which silently negates the ``wait=False`` of the cancellation inside
+    it. Measured with six-second fetches: SIGINT at t=1.00s, run_batch raised
+    at t=6.01s. On an hour-long mix that is minutes of animating bars and no
+    message. The abort test above never asserted elapsed time, which is
+    exactly why this stayed invisible.
+
+    The second half is the other half of the contract: cancelling must not
+    abandon the track already downloading. It still publishes and is still
+    recorded, so a resume does not re-fetch it.
+    """
+    settings = make_settings(tmp_path, jobs=2)
+    downloader = GatedDownloader(
+        "slow", cancel_ids=("bad",), cancel_error=KeyboardInterrupt
+    )
+    refs = [
+        TrackRef("slow", "https://x/slow", "Slow Track", 1.0),
+        TrackRef("bad", "https://x/bad", "Bad", 1.0),
+    ]
+    archive = Archive(tmp_path / "a.txt")
+    start = time.monotonic()
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            run_batch(
+                refs,
+                settings=settings,
+                downloader=downloader,
+                reporter=RecordingReporter(),
+                archive=archive,
+                encode=fake_encode,
+            )
+        elapsed = time.monotonic() - start
+        assert downloader.entered.is_set(), "the gated fetch never started"
+        assert elapsed < 1.0, f"the abort waited {elapsed:.2f}s for the in-flight fetch"
+    finally:
+        downloader.released.set()
+
+    published = settings.destination / "Slow Track.mp3"
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline and not published.exists():
+        time.sleep(0.01)
+    # The worker was not killed: concurrent.futures joins it at interpreter
+    # shutdown, and it finishes its track properly on the way out.
+    assert published.read_bytes() == b"mp3-bytes"
+    while time.monotonic() < deadline and "slow" not in archive:
+        time.sleep(0.01)
+    assert "slow" in archive
+
+
+def test_a_repeated_video_id_is_processed_once(tmp_path: Path) -> None:
+    """Two refs naming the same video would share one staging directory.
+
+    ``staging_dir`` is keyed on the video id, so at the default ``jobs > 1``
+    both refs clear the archive check before either records, and whichever
+    finishes first rmtrees the other's working files mid-download. Nothing
+    upstream deduplicates: ``yt2mp3 URL URL``, a ``--from-file`` list with a
+    repeat and a playlist holding the same video twice all reach here intact.
+    """
+    settings = make_settings(tmp_path, jobs=2)
+    # Same id, different spelling and title -- the pair a playlist and a direct
+    # URL produce. The first occurrence wins, so the first title is the file.
+    refs = [
+        TrackRef("aaa", "https://x/aaa", "Some Mix", 12.0),
+        TrackRef("aaa", "https://youtu.be/aaa", "Some Mix [Official Audio]", 12.0),
+    ]
+    downloader = FakeDownloader()
+    reporter = RecordingReporter()
+    result = run_batch(
+        refs,
+        settings=settings,
+        downloader=downloader,
+        reporter=reporter,
+        archive=Archive(tmp_path / "a.txt"),
+        encode=fake_encode,
+    )
+    assert [outcome.status for outcome in result.outcomes] == [STATUS_DONE]
+    assert result.outcomes[0].ref is refs[0]
+    assert result.exit_code == 0
+    assert [call.video_id for call in downloader.calls] == ["aaa"]
+    assert [path.name for path in settings.destination.iterdir()] == ["Some Mix.mp3"]
+    # The batch bar is told the deduplicated count, or it stops one short.
+    assert ("batch", "1") in reporter.events
+
+
+def test_keep_source_still_fits_the_destination_path(tmp_path: Path) -> None:
+    """``--keep-source`` publishes a second file under a longer suffix.
+
+    The stem budget reserves ``.mp3`` (4 characters), but the kept source is
+    whatever YouTube served -- ``.webm`` or ``.opus``, 5 characters. At a
+    binding budget that one extra character puts the ``.part`` form at 261
+    with the NUL, over the limit, after the download has been paid for.
+    """
+    target_budget = 40
+    # `used` inside stem_budget: destination + "/" + suffix + ".part" + NUL.
+    reserved = 1 + len(KEPT_SOURCE_EXTENSION) + len(".part") + 1
+    pad = WINDOWS_PATH_LIMIT - reserved - target_budget - len(str(tmp_path)) - 1
+    destination = tmp_path / ("d" * pad)
+    settings = make_settings(
+        tmp_path, destination=destination, jobs=1, keep_source=True
+    )
+    # The premise: at this destination the two budgets genuinely differ, and
+    # that single character is what crosses the limit.
+    assert stem_budget(destination, extension=KEPT_SOURCE_EXTENSION) == target_budget
+    assert stem_budget(destination) == target_budget + 1
+
+    result = run_batch(
+        [TrackRef("aaa", "https://x/aaa", "L" * 200, 1.0)],
+        settings=settings,
+        downloader=FakeDownloader(),
+        reporter=RecordingReporter(),
+        archive=Archive(tmp_path / "a.txt"),
+        encode=fake_encode,
+    )
+    assert result.outcomes[0].status == STATUS_DONE
+
+    names = sorted(path.name for path in destination.iterdir())
+    assert [Path(name).suffix for name in names] == [".mp3", ".opus"]
+    for name in names:
+        # publish writes "<name>.part" before revealing it, so that is the
+        # longest path this file ever occupies. `<` not `<=`: MAX_PATH counts
+        # the NUL terminator that this expression does not.
+        assert (
+            len(str(destination)) + 1 + len(name) + len(".part") < WINDOWS_PATH_LIMIT
+        )
+
+
+def test_an_unwritable_staging_root_fails_the_track_instead_of_the_run(
+    tmp_path: Path,
+) -> None:
+    """``staging_dir``'s mkdir must not raise outside the Yt2Mp3Error contract.
+
+    A bare OSError here escapes ``process_track``'s handler and aborts the
+    whole batch -- the identical defect ``Archive.add`` already guards, one
+    module over.
+    """
+    if os.geteuid() == 0:
+        pytest.skip("root ignores directory permissions")
+    root = tmp_path / "stage"
+    root.mkdir()
+    settings = make_settings(tmp_path, staging_root=root)
+    root.chmod(0o500)
+    try:
+        result = run_batch(
+            [REF],
+            settings=settings,
+            downloader=FakeDownloader(),
+            reporter=RecordingReporter(),
+            archive=Archive(tmp_path / "a.txt"),
+            encode=fake_encode,
+        )
+    finally:
+        root.chmod(0o700)
+    assert result.outcomes[0].status == STATUS_FAILED
+    assert "staging" in (result.outcomes[0].error or "")
+    assert result.exit_code == 1

@@ -45,7 +45,12 @@ if [[ -e "$link" || -L "$link" ]]; then
         exit 1
     fi
 else
-    ln -s -- "$launcher" "$link"
+    # The RESOLVED path, not $PWD's logical spelling: if this script was
+    # reached through a symlinked directory, a link recording the logical
+    # form goes stale the moment that directory is removed -- and the next
+    # direct run compares it against $launcher_real, finds a mismatch and
+    # refuses to overwrite the link it created itself.
+    ln -s -- "$launcher_real" "$link"
     echo "installed -> $link"
 fi
 

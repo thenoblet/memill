@@ -13,8 +13,8 @@ from typing import Any, Protocol
 
 from yt2mp3.config import Settings
 from yt2mp3.encoder import build_encode_command, run_encode
-from yt2mp3.errors import Yt2Mp3Error
-from yt2mp3.naming import infer_tags, output_stem, stem_budget
+from yt2mp3.errors import TransferError, Yt2Mp3Error
+from yt2mp3.naming import KEPT_SOURCE_EXTENSION, infer_tags, output_stem, stem_budget
 from yt2mp3.reporting import PHASE_DOWNLOAD, PHASE_ENCODE, ProgressReporter
 from yt2mp3.source import SourceMedia, TrackRef
 from yt2mp3.transfer import Archive, publish
@@ -130,7 +130,16 @@ def staging_dir(root: Path, key: str) -> Iterator[Path]:
     if not key or "/" in key or "\\" in key or key in _TRAVERSAL:
         raise Yt2Mp3Error(f"unsafe staging key: {key!r}")
     path = root / key
-    path.mkdir(parents=True, exist_ok=True)
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        # A read-only staging root, a full disk or a bad --cache path are
+        # expected failures, not bugs. A bare OSError here would fly past the
+        # pipeline's Yt2Mp3Error handler and abort the whole batch -- the same
+        # defect Archive.add already guards against, one module over.
+        raise TransferError(
+            f"could not create the staging directory {path}: {exc}"
+        ) from exc
     try:
         yield path
     finally:
@@ -181,7 +190,17 @@ def process_track(
             media = downloader.fetch(ref, staging, report)
 
             tags = infer_tags(media.info, clean=settings.clean_titles)
-            budget = stem_budget(settings.destination)
+            # One budget covers both published files, so it has to be sized for
+            # the longer suffix. --keep-source publishes "<stem><source suffix>"
+            # alongside "<stem>.mp3", and YouTube audio arrives as .webm/.opus
+            # -- one character more than the .mp3 the budget would otherwise
+            # assume, which is enough to cross the 260-char NTFS limit.
+            budget = stem_budget(
+                settings.destination,
+                extension=(
+                    KEPT_SOURCE_EXTENSION if settings.keep_source else ".mp3"
+                ),
+            )
             stem = registry.claim(
                 output_stem(tags, max_length=budget), max_length=budget
             )
@@ -216,6 +235,26 @@ def process_track(
         return TrackOutcome(ref, STATUS_FAILED, error=str(exc))
 
 
+def _unique_by_id(refs: Sequence[TrackRef]) -> list[TrackRef]:
+    """Drop repeated video ids, keeping the first occurrence and input order.
+
+    ``staging_dir`` is keyed on the video id, so two refs naming the same video
+    share one scratch directory: at the default ``jobs > 1`` both clear the
+    archive check before either records, and whichever finishes first rmtrees
+    the other's working files mid-download. Reachable from ``yt2mp3 URL URL``,
+    a ``--from-file`` list with a repeat, or a playlist containing the same
+    video twice -- and none of ``collect_urls``, ``expand`` or the archive
+    deduplicates before this point.
+    """
+    seen: set[str] = set()
+    unique: list[TrackRef] = []
+    for ref in refs:
+        if ref.video_id not in seen:
+            seen.add(ref.video_id)
+            unique.append(ref)
+    return unique
+
+
 def run_batch(
     refs: Sequence[TrackRef],
     *,
@@ -226,13 +265,22 @@ def run_batch(
     encode: EncodeFn = run_encode,
 ) -> BatchResult:
     """Process every ref, at most ``settings.jobs`` at a time."""
-    reporter.batch_started(len(refs))
-    if not refs:
+    queue = _unique_by_id(refs)
+    # The deduplicated count, not the given one: a batch bar told there are
+    # four tracks when three will ever finish stops one short of full.
+    reporter.batch_started(len(queue))
+    if not queue:
         return BatchResult()
 
-    results: list[TrackOutcome | None] = [None] * len(refs)
+    results: list[TrackOutcome | None] = [None] * len(queue)
     stems = StemRegistry()
-    with ThreadPoolExecutor(max_workers=settings.jobs) as pool:
+    # Not `with ThreadPoolExecutor(...)`: its __exit__ calls shutdown(wait=True),
+    # which negates the wait=False below and holds a Ctrl-C until every in-flight
+    # fetch has finished -- minutes on an hour-long mix, with the bars still
+    # animating and nothing said. The explicit finally lets the exception
+    # surface at once.
+    pool = ThreadPoolExecutor(max_workers=settings.jobs)
+    try:
         futures = {
             pool.submit(
                 process_track,
@@ -244,23 +292,24 @@ def run_batch(
                 encode=encode,
                 stems=stems,
             ): index
-            for index, ref in enumerate(refs)
+            for index, ref in enumerate(queue)
         }
-        try:
-            for future in as_completed(futures):
-                results[futures[future]] = future.result()
-        # BaseException, deliberately, not Exception: KeyboardInterrupt is
-        # the case that matters most here and is not an Exception, so the
-        # narrower clause would let Ctrl-C skip the cancellation below and
-        # surface only once the whole queue had drained.
-        except BaseException:
-            # Only a run-level abort gets here -- a cancelled download, an
-            # unreadable cookie store, Ctrl-C -- because process_track
-            # returns its own failures. Every ref was submitted up front, so
-            # without this the remaining 199 tracks of a 200-track playlist
-            # would still download before anyone saw the exception.
-            pool.shutdown(wait=False, cancel_futures=True)
-            raise
+        # No `except BaseException: raise` clause is needed to reach the
+        # cancellation: a finally runs for KeyboardInterrupt too, which the
+        # narrower `except Exception` never would. Only a run-level abort can
+        # get out of here at all -- a cancelled download, an unreadable cookie
+        # store, Ctrl-C -- because process_track returns its own failures.
+        for future in as_completed(futures):
+            results[futures[future]] = future.result()
+    finally:
+        # cancel_futures drops everything still queued, so the remaining 199
+        # tracks of a 200-track playlist never start. wait=False means we do
+        # not block on the handful already running -- they are not killed:
+        # each finishes its download, publishes and records its track, and
+        # concurrent.futures' own atexit hook joins the threads before the
+        # interpreter exits. On the success path every future is already done,
+        # so this cancels nothing and returns immediately.
+        pool.shutdown(wait=False, cancel_futures=True)
 
     # Input order, not completion order: the summary should read like the queue.
     return BatchResult(tuple(outcome for outcome in results if outcome is not None))

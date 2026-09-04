@@ -11,6 +11,7 @@ running. Use the context manager or call close() to restore them.
 
 from __future__ import annotations
 
+import threading
 from typing import Protocol, TextIO, runtime_checkable
 
 from rich.console import Console
@@ -88,10 +89,19 @@ class RichReporter:
     Always use the context manager or call close() to restore them.
     """
 
-    __slots__ = ("_done", "_labels", "_overall", "_progress", "_tasks", "_total")
+    __slots__ = (
+        "_done",
+        "_labels",
+        "_lock",
+        "_overall",
+        "_progress",
+        "_tasks",
+        "_total",
+    )
 
     def __init__(self, progress: Progress) -> None:
         self._progress = progress
+        self._lock = threading.Lock()
         self._tasks: dict[str, TaskID] = {}
         self._labels: dict[str, str] = {}
         self._overall: TaskID | None = None
@@ -155,11 +165,19 @@ class RichReporter:
             return
         self._labels.pop(key, None)
         self._progress.remove_task(task)
-        self._done += 1
-        if self._overall is not None:
-            self._progress.update(
-                self._overall, advance=1, label=f"{self._done}/{self._total} tracks"
-            )
+        # `+= 1` is a read-modify-write, and the pool calls this from several
+        # threads at once: two finishes can read the same value and one write
+        # is lost, so a 40-track run ends its label reading "38/40 tracks".
+        # rich's own Progress is lock-guarded, which is why the bar stays
+        # right and only this counter is wrong -- and why the update is held
+        # inside the lock too, so the label cannot go backwards when two
+        # threads reach it out of order.
+        with self._lock:
+            self._done += 1
+            if self._overall is not None:
+                self._progress.update(
+                    self._overall, advance=1, label=f"{self._done}/{self._total} tracks"
+                )
 
     def close(self) -> None:
         self._progress.stop()

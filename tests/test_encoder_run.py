@@ -30,18 +30,6 @@ def tone(tmp_path: Path) -> Path:
     return path
 
 
-@pytest.fixture
-def long_tone(tmp_path: Path) -> Path:
-    """Ten seconds of 440Hz -- long enough to emit multiple progress blocks."""
-    path = tmp_path / "long_tone.wav"
-    subprocess.run(
-        ["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi",
-         "-i", "sine=frequency=440:duration=10", str(path)],
-        check=True,
-    )
-    return path
-
-
 def test_encode_writes_an_mp3_and_reports_progress(tone: Path, tmp_path: Path) -> None:
     output = tmp_path / "out.mp3"
     seen: list[float] = []
@@ -80,18 +68,29 @@ def test_encode_without_progress_callback(tone: Path, tmp_path: Path) -> None:
     assert output.stat().st_size > 0
 
 
-def test_progress_is_reported_incrementally(long_tone: Path, tmp_path: Path) -> None:
-    """A single terminal ``1.0`` would satisfy the other progress assertions."""
+def test_progress_is_reported_more_than_once(tone: Path, tmp_path: Path) -> None:
+    """A single terminal ``1.0`` would satisfy the other progress assertions.
+
+    This ran on a ten-second fixture said to be "long enough to emit multiple
+    progress blocks". Measured, that was false: libmp3lame encodes at roughly
+    380x realtime here, so ten seconds of audio finishes inside ffmpeg's first
+    stats period and yields exactly the two blocks two seconds does. The
+    assertion held anyway because ffmpeg bookends every run with a start
+    report and a final ``progress=end``, which is what it is really proving --
+    that run_encode hands each block on as it parses it rather than calling
+    back once at the end. No fixture short enough for a test suite can span
+    two stats periods, so the longer tone bought nothing and is gone.
+    """
     output = tmp_path / "out.mp3"
     seen: list[float] = []
     run_encode(
         build_encode_command(
-            audio=long_tone,
+            audio=tone,
             output=output,
             quality=VbrQuality(5),
             tags=TrackTags(title="Tone"),
         ),
-        duration=10.0,
+        duration=2.0,
         on_progress=seen.append,
     )
     assert len(seen) > 1, "progress must stream, not arrive only at completion"

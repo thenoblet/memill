@@ -34,6 +34,16 @@ _RESERVED = frozenset(
 
 _PART_SUFFIX = ".part"  # transfer writes "<name>.mp3.part" before renaming
 
+# What --keep-source has to budget for. The stem is chosen before the download
+# finishes, so the source's real suffix is not knowable at the moment it is
+# needed: this is the longest plausible audio suffix rather than the actual one.
+# YouTube serves .webm and .opus; .flac and .weba turn up on other extractors,
+# and all four are five characters. Budgeting conservatively costs a character
+# of title on a deep destination path; budgeting the .mp3 that publish does NOT
+# use for this file produces a path over the NTFS limit that fails only after
+# the download has been paid for.
+KEPT_SOURCE_EXTENSION = ".webm"
+
 
 def sanitize_stem(stem: str, *, max_length: int = DEFAULT_MAX_STEM) -> str:
     """Return ``stem`` as a filename NTFS will accept, without its extension.

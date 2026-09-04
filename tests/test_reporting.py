@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import io
+import threading
+import time
 
 import pytest
 
@@ -150,6 +152,57 @@ def test_rich_reporter_drives_all_methods_and_tracks_tasks() -> None:
         assert batch_task.completed == batch_completed_before
     finally:
         rich_reporter.close()
+
+
+def test_the_batch_label_counts_every_finish_under_concurrency() -> None:
+    """``self._done += 1`` is a read-modify-write, called from pool threads.
+
+    rich's own Progress is lock-guarded, so the bar itself stays right and
+    only the label built from this counter is wrong -- which is why a 40-track
+    run can finish reading "38/40 tracks" and look like a display glitch.
+
+    The race is made certain rather than hoped for: ``_done`` is replaced with
+    an int subclass whose ``__add__`` sleeps, holding the read-modify-write
+    window open for 10ms, and every thread is released from a barrier into it
+    at once. Unguarded, all eight read 0 and all eight store 1. Guarded, they
+    serialise and the count is exact.
+    """
+
+    class SlowInt(int):
+        """An int whose addition takes long enough to lose a concurrent write."""
+
+        def __add__(self, other: int) -> SlowInt:
+            time.sleep(0.01)
+            return SlowInt(int(self) + other)
+
+    workers = 8
+    reporter = RichReporter.for_stream(io.StringIO())
+    try:
+        reporter.batch_started(workers)
+        for index in range(workers):
+            reporter.track_started(f"t{index}", f"Track {index}")
+        reporter._done = SlowInt(0)
+        ready = threading.Barrier(workers)
+
+        def finish(index: int) -> None:
+            ready.wait(timeout=10.0)
+            reporter.track_finished(f"t{index}", "done")
+
+        threads = [
+            threading.Thread(target=finish, args=(index,)) for index in range(workers)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30.0)
+
+        assert reporter._done == workers
+        assert reporter._overall is not None
+        batch_task = reporter._progress._tasks[reporter._overall]
+        assert batch_task.fields["label"] == f"{workers}/{workers} tracks"
+        assert batch_task.completed == workers
+    finally:
+        reporter.close()
 
 
 def test_rich_reporter_context_manager_stops_the_display() -> None:

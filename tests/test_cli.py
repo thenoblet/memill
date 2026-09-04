@@ -162,6 +162,18 @@ def test_output_flag_overrides_the_destination() -> None:
     assert settings.destination == Path("/tmp/music")
 
 
+def test_a_quoted_tilde_destination_is_expanded() -> None:
+    """The shell expands an unquoted ``~`` and leaves a quoted one alone.
+
+    ``-o "~/music"`` therefore reaches argparse as a literal tilde, and
+    without expansion the run creates a directory actually named ``~`` in the
+    working directory and files the library inside it.
+    """
+    settings = settings_from_args(parse("https://x/1", "-o", "~/music"), cpu_count=8)
+    assert settings.destination == Path.home() / "music"
+    assert "~" not in str(settings.destination)
+
+
 def test_jobs_and_fragments_hold_the_connection_budget() -> None:
     settings = settings_from_args(parse("https://x/1", "-j", "2"), cpu_count=8)
     assert (settings.jobs, settings.fragments) == (2, 4)

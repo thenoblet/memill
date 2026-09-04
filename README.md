@@ -25,9 +25,10 @@ replacing it.
 
 ## What it does
 
-1. yt-dlp fetches the **audio-only** stream. The video track of a music video
-   runs 1-3 Mbps against the audio's ~160 kbps, so it is most of what you would
-   otherwise pay for, and this never downloads it.
+1. yt-dlp fetches the **audio-only** stream. A video track is far larger than
+   the audio it carries, whatever resolution YouTube happens to serve, so
+   skipping it is the single biggest saving in the run -- and this never
+   downloads it.
 2. One ffmpeg pass encodes to MP3, writes ID3v2.3 tags (plus a v1 trailer for
    older players) and embeds the thumbnail as square cover art, centre-cropped
    from 16:9. Not three chained passes rewriting the file each time.
@@ -90,7 +91,8 @@ for transcoded material; `-b 320k` is there if you want it anyway.
 
 `tests/test_end_to_end.py` is the only suite that shells out to ffmpeg. It
 synthesises its own tone and artwork with `lavfi` and skips itself when ffmpeg
-or ffprobe is absent. It needs one encoder beyond what the tool itself uses: the
-native `mpeg4` encoder, to build a muxed audio+video fixture. Nothing in the
-suite touches the network; a real download is the one thing left that does, and
-that is your call to run.
+or ffprobe is absent. It needs three encoders the tool itself never uses:
+`mpeg4`, to build a muxed audio+video fixture; `png`, for the cover fixtures;
+and `rawvideo`, to read a pixel back out. Nothing in the suite touches the
+network; a real download is the one thing left that does, and that is your call
+to run.

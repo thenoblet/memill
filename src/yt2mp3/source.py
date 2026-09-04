@@ -55,6 +55,18 @@ def _as_float(value: Any) -> float | None:
 
 
 def _ref_from_entry(entry: Mapping[str, Any]) -> TrackRef | None:
+    # Under extract_flat="in_playlist" a channel URL's top-level entries are
+    # playlist tabs -- Videos, Shorts, Live -- not videos. Each carries an id
+    # and a title, so without this check every tab becomes a TrackRef whose
+    # fetch fails with "yt-dlp did not report a downloaded file", a message
+    # that never mentions the channel URL that actually caused it.
+    #
+    # Defensive: this sits below the network seam, so the shape of a real
+    # channel response cannot be proven by the offline suite. The check costs
+    # nothing if yt-dlp never sets _type on the entries we do want, because a
+    # video entry's _type is "url" or "video", never "playlist".
+    if entry.get("_type") == "playlist":
+        return None
     video_id = entry.get("id")
     if not isinstance(video_id, str) or not video_id:
         return None

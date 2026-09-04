@@ -69,6 +69,29 @@ def test_expand_skips_unavailable_entries(tmp_path: Path) -> None:
     assert [ref.video_id for ref in downloader.expand(["https://x/p"])] == ["bbb"]
 
 
+def test_expand_skips_playlist_entries(tmp_path: Path) -> None:
+    """A channel URL's top-level entries are playlist tabs, not videos.
+
+    Under ``extract_flat="in_playlist"`` yt-dlp returns one entry per tab --
+    Videos, Shorts, Live -- each carrying an id and a title, so an unfiltered
+    ``_ref_from_entry`` turns every tab into a TrackRef whose fetch then dies
+    with "yt-dlp did not report a downloaded file", a message that never
+    mentions the channel URL that caused it.
+
+    Written from yt-dlp's ``_type`` contract rather than from an observed
+    response: the seam this suite fakes sits above the network, so the real
+    shape of a channel extraction cannot be proven here.
+    """
+    info = {
+        "entries": [
+            {"_type": "playlist", "id": "UCabc-videos", "title": "Chan - Videos"},
+            {"_type": "url", "id": "bbb", "title": "Two", "url": "https://x/bbb"},
+        ]
+    }
+    downloader = Downloader(make_settings(tmp_path), ydl_factory=fake_factory(info, []))
+    assert [ref.video_id for ref in downloader.expand(["https://x/chan"])] == ["bbb"]
+
+
 def test_fetch_returns_the_path_yt_dlp_reported(tmp_path: Path) -> None:
     staging = tmp_path / "stage" / "aaa"
     staging.mkdir(parents=True)

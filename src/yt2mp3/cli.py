@@ -76,6 +76,17 @@ def _job_count(text: str) -> int:
     return jobs
 
 
+def _destination(text: str) -> Path:
+    """A destination directory, with a leading ``~`` expanded.
+
+    The shell expands an unquoted tilde and leaves a quoted one alone, so
+    ``-o "~/music"`` and ``-o '~/music'`` reach argparse as a literal ``~``.
+    Without this the run silently creates a directory actually named ``~`` in
+    the working directory and puts the library there.
+    """
+    return Path(text).expanduser()
+
+
 def _existing_file(text: str) -> Path:
     """Refuse a path that is plainly unusable, without opening it.
 
@@ -111,7 +122,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "-o",
         "--output",
-        type=Path,
+        type=_destination,
         default=DEFAULT_DESTINATION,
         help="destination directory",
     )
