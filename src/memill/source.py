@@ -201,16 +201,10 @@ class Downloader:
         empty run.
         """
         opts: dict[str, Any] = {
+            **self._common_opts(),
             "extract_flat": "in_playlist",
             "skip_download": True,
-            "quiet": True,
-            "no_warnings": True,
         }
-        if self._settings.cookies_from_browser:
-            # Resolution runs BEFORE any download, so an age-restricted or
-            # members-only URL fails here unless the cookies reach this step
-            # too -- which is precisely the content the flag exists for.
-            opts["cookiesfrombrowser"] = (self._settings.cookies_from_browser,)
         refs: list[TrackRef] = []
         failures: list[str] = []
         first: YoutubeDLError | None = None
@@ -253,6 +247,26 @@ class Downloader:
             raise DownloadError("; ".join(failures)) from first
         return refs
 
+    def _common_opts(self) -> dict[str, Any]:
+        """The options every yt-dlp session gets, whichever call site opens it.
+
+        There are two of those -- ``expand`` resolves, ``fetch`` downloads --
+        and they were written as separate literals, which is how
+        ``--cookies-from-browser`` came to be honoured by only one of them.
+        Resolution runs first, so age-restricted content failed before the
+        download the flag was meant to unlock ever started; the fix had to be
+        applied twice and the second site was nearly missed. Adding a key here
+        now reaches both by construction.
+
+        A fresh dict per call, never a shared or cached one: ``YoutubeDL``
+        writes its own defaults into the options it is handed, so a dict that
+        outlived one session would carry that pollution into the next.
+        """
+        opts: dict[str, Any] = {"quiet": True, "no_warnings": True}
+        if self._settings.cookies_from_browser:
+            opts["cookiesfrombrowser"] = (self._settings.cookies_from_browser,)
+        return opts
+
     def _download_opts(
         self,
         staging: Path,
@@ -260,6 +274,7 @@ class Downloader:
         recorder: _Recorder,
     ) -> dict[str, Any]:
         opts: dict[str, Any] = {
+            **self._common_opts(),
             "format": "bestaudio/best",
             "outtmpl": {"default": str(staging / "%(id)s.%(ext)s")},
             "noplaylist": True,
@@ -269,20 +284,16 @@ class Downloader:
             "retries": 5,
             "fragment_retries": 5,
             "socket_timeout": 20,
-            "quiet": True,
-            "no_warnings": True,
             "noprogress": True,
-            # Those three are not enough on their own: report_error consults
-            # none of them. The logger is what actually keeps yt-dlp's last
-            # retry failure off our stderr, and it hands us the reason it
-            # would otherwise have printed there. Fresh per call, because the
-            # options dict is too.
+            # Neither that nor the shared ``quiet``/``no_warnings`` is enough
+            # on its own: report_error consults none of them. The logger is
+            # what actually keeps yt-dlp's last retry failure off our stderr,
+            # and it hands us the reason it would otherwise have printed
+            # there. Fresh per call, because the options dict is too.
             "logger": recorder,
             # ffmpeg is ours; yt-dlp must not post-process behind our back.
             "postprocessors": [],
         }
-        if self._settings.cookies_from_browser:
-            opts["cookiesfrombrowser"] = (self._settings.cookies_from_browser,)
         if on_progress is not None:
             opts["progress_hooks"] = [_make_hook(on_progress)]
         return opts

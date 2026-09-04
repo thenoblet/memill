@@ -412,6 +412,86 @@ def test_expand_passes_browser_cookies_only_when_configured(tmp_path: Path) -> N
     assert with_cookies.sessions[0].received["cookiesfrombrowser"] == ("firefox",)
 
 
+def test_resolution_and_download_share_exactly_one_set_of_options(
+    tmp_path: Path,
+) -> None:
+    """Everything the two call sites have in common comes from one base.
+
+    ``--cookies-from-browser`` was originally written into the download
+    options alone. Resolution runs first, so the age-restricted content the
+    flag exists to unlock failed before the download it was meant to fix ever
+    began -- and the fix then had to be applied to two separately written
+    literals. Pinning the overlap to ``_common_opts`` is what stops the next
+    shared key being added to only one of them: re-inlining
+    ``cookiesfrombrowser`` into ``_download_opts`` alone shrinks the overlap
+    and fails here, and giving one site a different ``quiet`` fails the value
+    comparison below.
+
+    ``logger`` is excluded because it is deliberately NOT shared: each session
+    gets its own recorder so one URL's complaint is never reported against
+    another's.
+    """
+    staging, info = staged_audio(tmp_path)
+    settings = make_settings(tmp_path, cookies_from_browser="firefox")
+
+    resolving = SpyFactory({"id": "aaa", "title": "One", "webpage_url": "https://x/a"})
+    Downloader(settings, ydl_factory=resolving).expand(["https://x/a"])
+
+    downloading = SpyFactory(info)
+    Downloader(settings, ydl_factory=downloading).fetch(
+        TrackRef("aaa", "https://x/aaa", "One", None), staging
+    )
+
+    resolved = resolving.sessions[0].received
+    downloaded = downloading.sessions[0].received
+    common = (set(resolved) & set(downloaded)) - {"logger"}
+
+    base = Downloader(settings)._common_opts()
+    assert common == set(base)
+    assert {key: resolved[key] for key in common} == base
+    assert {key: downloaded[key] for key in common} == base
+    # The base is what carried the cookies to the step that was failing.
+    assert base["cookiesfrombrowser"] == ("firefox",)
+
+
+def test_the_shared_base_is_never_a_shared_dict(tmp_path: Path) -> None:
+    """One base for both call sites must not become one dict for both.
+
+    ``YoutubeDL`` writes its own defaults into the options it is handed, so a
+    base built once and handed out repeatedly would carry the first session's
+    pollution into every later one -- and now, with the two call sites fed
+    from the same helper, across the resolution/download boundary as well.
+    Caching the base on the ``Downloader`` and handing it straight to the
+    factory is the mutation this kills: the second fetch below would then see
+    every key the earlier three sessions injected.
+
+    ``outtmpl`` is the one injected key we set ourselves, and only on the
+    download path.
+    """
+    staging, info = staged_audio(tmp_path)
+    spy = SpyFactory(info)
+    downloader = Downloader(
+        make_settings(tmp_path, cookies_from_browser="firefox"), ydl_factory=spy
+    )
+    ref = TrackRef("aaa", "https://x/aaa", "One", None)
+
+    downloader.expand(["https://x/a", "https://x/b"])
+    downloader.fetch(ref, staging)
+    downloader.fetch(ref, staging)
+
+    assert len(spy.sessions) == 4
+    # Four distinct dict objects, none of them another's.
+    assert len({id(session.opts) for session in spy.sessions}) == 4
+    for session in spy.sessions[:2]:
+        assert not set(session.received) & set(YT_DLP_INJECTED_KEYS)
+    for session in spy.sessions[2:]:
+        assert set(session.received) & set(YT_DLP_INJECTED_KEYS) == {"outtmpl"}
+    # And the shared values survive intact into the last session of all.
+    assert spy.sessions[-1].received["cookiesfrombrowser"] == ("firefox",)
+    assert spy.sessions[-1].received["quiet"] is True
+    assert spy.sessions[-1].received["no_warnings"] is True
+
+
 def test_the_progress_hook_reports_the_fraction_downloaded(tmp_path: Path) -> None:
     staging, info = staged_audio(tmp_path)
     spy = SpyFactory(info)
